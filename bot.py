@@ -113,6 +113,15 @@ except ImportError as e:
     logger.warning(f"⚠️ Квиз модуль недоступен: {e}")
     QUIZ_AVAILABLE = False
 
+# Импорт модуля брейншторма
+try:
+    from brainstorm_mod import register_brainstorm_handlers, init_brainstorm_llm, get_brainstorm_stats, register_brainstorm_menu_handler
+    BRAINSTORM_AVAILABLE = True
+    logger.info("🧠 Модуль брейншторма загружен")
+except ImportError as e:
+    logger.warning(f"⚠️ Модуль брейншторма недоступен: {e}")
+    BRAINSTORM_AVAILABLE = False
+
 # Глобальные переменные для RAG систем (инициализируются лениво)
 optimized_rag = None
 modern_rag = None
@@ -642,6 +651,12 @@ async def cmd_start(message: Message):
         ]
     ]
     
+    # Добавляем кнопку брейншторма, если модуль доступен
+    if BRAINSTORM_AVAILABLE:
+        keyboard_rows.append([
+            InlineKeyboardButton(text="🧠 Брейншторм идей", callback_data="start_brainstorm")
+        ])
+    
     # Добавляем кнопку календаря, если модуль доступен
     if CALENDAR_AVAILABLE:
         keyboard_rows.append([
@@ -915,6 +930,15 @@ if QUIZ_AVAILABLE:
     except Exception as e:
         logger.error(f"❌ Ошибка регистрации квиза: {e}")
 
+# Регистрируем обработчики брейншторма ПЕРЕД основным обработчиком текста
+if BRAINSTORM_AVAILABLE:
+    try:
+        register_brainstorm_handlers(dp, bot)
+        register_brainstorm_menu_handler(dp)
+        logger.info("✅ Обработчики брейншторма зарегистрированы ПЕРЕД основным обработчиком")
+    except Exception as e:
+        logger.error(f"❌ Ошибка регистрации брейншторма: {e}")
+
 # Обработчик текстовых сообщений от пользователей
 @dp.message(F.text)
 async def handle_text(message: Message, state: FSMContext):
@@ -932,6 +956,14 @@ async def handle_text(message: Message, state: FSMContext):
             logger.info(f"🎯 Команда /quiz от пользователя {user_id} - передаём в квиз-модуль")
         else:
             logger.info(f"🎯 Сообщение в состоянии квиза {current_state} - пропускаем основной обработчик")
+        return
+    
+    # Исключаем команду /brainstorm и состояния брейншторма - они обрабатываются в brainstorm_mod.py
+    if BRAINSTORM_AVAILABLE and (message.text == "/brainstorm" or (current_state and current_state.startswith("BrainstormState"))):
+        if message.text == "/brainstorm":
+            logger.info(f"🧠 Команда /brainstorm от пользователя {user_id} - передаём в брейншторм-модуль")
+        else:
+            logger.info(f"🧠 Сообщение в состоянии брейншторма {current_state} - пропускаем основной обработчик")
         return
     
     logger.info(f"📝 Получено сообщение от пользователя {user_id}: '{message.text}'")
@@ -1829,6 +1861,32 @@ async def cmd_rag_status(message: Message):
     response_text += f"1. Современная RAG (векторный поиск)\n"
     response_text += f"2. Оптимизированная RAG (кэширование)\n"
     response_text += f"3. Базовая RAG (ключевые слова)\n"
+    
+    await message.answer(response_text)
+
+@dp.message(Command("brainstorm_status"))
+async def cmd_brainstorm_status(message: Message):
+    """Команда для проверки статуса брейншторма"""
+    if BRAINSTORM_AVAILABLE:
+        stats = get_brainstorm_stats()
+        response_text = "🧠 **Статус модуля брейншторма:**\n\n"
+        response_text += f"✅ **Доступен:** Да\n"
+        response_text += f"📊 **Направлений:** {stats['directions_count']}\n"
+        response_text += f"🎯 **Направления:** {', '.join(stats['directions'][:5])}{'...' if len(stats['directions']) > 5 else ''}\n\n"
+        response_text += f"💡 **Команды:**\n"
+        response_text += f"• /brainstorm - запуск брейншторма\n"
+        response_text += f"• Используйте кнопку '🧠 Брейншторм идей' в меню\n\n"
+        response_text += f"🔧 **Функции:**\n"
+        response_text += f"• Выбор из 15 направлений обучения\n"
+        response_text += f"• Неограниченное количество вопросов\n"
+        response_text += f"• Помощь в формулировании идей проектов\n"
+        response_text += f"• Выход в любой момент"
+    else:
+        response_text = "❌ **Модуль брейншторма недоступен**\n\n"
+        response_text += "Возможные причины:\n"
+        response_text += "• Ошибка импорта модуля\n"
+        response_text += "• Не настроен API ключ\n"
+        response_text += "• Технические проблемы"
     
     await message.answer(response_text)
 
@@ -2785,6 +2843,19 @@ async def main():
         logger.info("✅ Квиз модуль готов к работе")
     else:
         logger.warning("⚠️ Квиз модуль недоступен")
+    
+    # Инициализируем модуль брейншторма
+    global BRAINSTORM_AVAILABLE
+    if BRAINSTORM_AVAILABLE:
+        try:
+            # Инициализируем LLM для брейншторма
+            init_brainstorm_llm(DEEPSEEK_API_KEY)
+            logger.info("✅ Модуль брейншторма готов к работе")
+        except Exception as e:
+            logger.error(f"❌ Ошибка инициализации брейншторма: {e}")
+            BRAINSTORM_AVAILABLE = False
+    else:
+        logger.warning("⚠️ Модуль брейншторма недоступен")
     
     print("=" * 60)
     print("✅ БОТ ГОТОВ К РАБОТЕ!")
