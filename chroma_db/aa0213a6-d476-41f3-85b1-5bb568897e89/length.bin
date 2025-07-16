@@ -1,0 +1,763 @@
+       if not return_dict:
+            return (sequence_output, mask, ids_restore) + encoder_outputs[1:]
+
+        return ViTMAEModelOutput(
+            last_hidden_state=sequence_output,
+            mask=mask,
+            ids_restore=ids_restore,
+            hidden_states=encoder_outputs.hidden_states,
+            attentions=encoder_outputs.attentions,
+        )
+
+
+class ViTMAEDecoder(nn.Module):
+    def __init__(self, config, num_patches):
+        super().__init__()
+        self.decoder_embed = nn.Linear(config.hidden_size, config.decoder_hidden_size, bias=True)
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, config.decoder_hidden_size))
+        self.decoder_pos_embed = nn.Parameter(
+            torch.zeros(1, num_patches + 1, config.decoder_hidden_size), requires_grad=False
+        )  # fixed sin-cos embedding
+
+        decoder_config = deepcopy(config)
+        decoder_config.hidden_size = config.decoder_hidden_size
+        decoder_config.num_hidden_layers = config.decoder_num_hidden_layers
+        decoder_config.num_attention_heads = config.decoder_num_attention_heads
+        decoder_config.intermediate_size = config.decoder_intermediate_size
+        self.decoder_layers = nn.ModuleList(
+            [ViTMAELayer(decoder_config) for _ in range(config.decoder_num_hidden_layers)]
+        )
+
+        self.decoder_norm = nn.LayerNorm(config.decoder_hidden_size, eps=config.layer_norm_eps)
+        self.decoder_pred = nn.Linear(
+            config.decoder_hidden_size, config.patch_size**2 * config.num_channels, bias=True
+        )  # encoder to decoder
+        self.gradient_checkpointing = False
+        self.config = config
+        self.initialize_weights(num_patches)
+
+    def interpolate_pos_encoding(self, embeddings: torch.Tensor) -> torch.Tensor:
+        """
+        This method is a modified version of the interpolation function for ViT-mae model at the decoder, that
+        allows to interpolate the pre-trained decoder position encodings, to be able to use the model on higher
+        resolution images.
+
+        Adapted from:
+        https://github.com/facebookresearch/dino/blob/de9ee3df6cf39fac952ab558447af1fa1365362a/vision_transformer.py#L174
+        """
+
+        # -1 removes the class dimension since we later append it without interpolation
+        embeddings_positions = embeddings.shape[1] - 1
+
+        # Separation of class token and patch tokens
+        class_pos_embed = self.decoder_pos_embed[:, :1]
+        patch_pos_embed = self.decoder_pos_embed[:, 1:]
+
+        # To retain the final 3d tensor with the required dimensions
+        dim = self.decoder_pos_embed.shape[-1]
+
+        # Increasing a dimension to enable bicubic interpolation
+        patch_pos_embed = patch_pos_embed.reshape(1, 1, -1, dim)
+
+        # permute to bring the dimension to be interpolated, to the last
+        patch_pos_embed = patch_pos_embed.permute(0, 3, 1, 2)
+
+        # Interpolating the decoder position embeddings shape wrt embeddings shape i.e (x).
+        # we keep the second last dimension constant
+        patch_pos_embed = nn.functional.interpolate(
+            patch_pos_embed,
+            size=(patch_pos_embed.shape[-2], embeddings_positions),
+            mode="bicubic",
+            align_corners=False,
+        )
+
+        # Converting back to the original shape
+        patch_pos_embed = patch_pos_embed.permute(0, 2, 3, 1).view(1, -1, dim)
+        # Adding the class token back
+        return torch.cat((class_pos_embed, patch_pos_embed), dim=1)
+
+    def initialize_weights(self, num_patches):
+        # initialize (and freeze) position embeddings by sin-cos embedding
+        decoder_pos_embed = get_2d_sincos_pos_embed(
+            self.decoder_pos_embed.shape[-1], int(num_patches**0.5), add_cls_token=True
+        )
+        self.decoder_pos_embed.data.copy_(torch.from_numpy(decoder_pos_embed).float().unsqueeze(0))
+
+        # timm's trunc_normal_(std=.02) is effectively normal_(std=0.02) as cutoff is too big (2.)
+        torch.nn.init.normal_(self.mask_token, std=self.config.initializer_range)
+
+    def forward(
+        self,
+        hidden_states,
+        ids_restore,
+        output_attentions=False,
+        output_hidden_states=False,
+        return_dict=True,
+        interpolate_pos_encoding: bool = False,
+    ):
+        # embed tokens
+        x = self.decoder_embed(hidden_states)
+
+        # append mask tokens to sequence
+        mask_tokens = self.mask_token.repeat(x.shape[0], ids_restore.shape[1] + 1 - x.shape[1], 1)
+        x_ = torch.cat([x[:, 1:, :], mask_tokens], dim=1)  # no cls token
+        # unshuffle
+        x_ = torch.gather(x_, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x.shape[2]).to(x_.device))
+        x = torch.cat([x[:, :1, :], x_], dim=1)  # append cls token
+        # add pos embed
+        if interpolate_pos_encoding:
+            decoder_pos_embed = self.interpolate_pos_encoding(x)
+        else:
+            decoder_pos_embed = self.decoder_pos_embed
+        hidden_states = x + decoder_pos_embed
+
+        # apply Transformer layers (blocks)
+        all_hidden_states = () if output_hidden_states else None
+        all_self_attentions = () if output_attentions else None
+        for i, layer_module in enumerate(self.decoder_layers):
+            if output_hidden_states:
+                all_hidden_states = all_hidden_states + (hidden_states,)
+
+            if self.gradient_checkpointing and self.training:
+                layer_outputs = self._gradient_checkpointing_func(
+                    layer_module.__call__,
+                    hidden_states,
+                    None,
+                    output_attentions,
+                )
+            else:
+                layer_outputs = layer_module(hidden_states, head_mask=None, output_attentions=output_attentions)
+
+            hidden_states = layer_outputs[0]
+
+            if output_attentions:
+                all_self_attentions = all_self_attentions + (layer_outputs[1],)
+
+        if output_hidden_states:
+            all_hidden_states = all_hidden_states + (hidden_states,)
+
+        hidden_states = self.decoder_norm(hidden_states)
+
+        # predictor projection
+        logits = self.decoder_pred(hidden_states)
+
+        # remove cls token
+        logits = logits[:, 1:, :]
+
+        if not return_dict:
+            return tuple(v for v in [logits, all_hidden_states, all_self_attentions] if v is not None)
+        return ViTMAEDecoderOutput(
+            logits=logits,
+            hidden_states=all_hidden_states,
+            attentions=all_self_attentions,
+        )
+
+
+@auto_docstring(
+    custom_intro="""
+    The ViTMAE Model transformer with the decoder on top for self-supervised pre-training.
+
+    <Tip>
+
+    Note that we provide a script to pre-train this model on custom data in our [examples
+    directory](https://github.com/huggingface/transformers/tree/main/examples/pytorch/image-pretraining).
+
+    </Tip>
+    """
+)
+class ViTMAEForPreTraining(ViTMAEPreTrainedModel):
+    def __init__(self, config):
+        super().__init__(config)
+        self.config = config
+
+        self.vit = ViTMAEModel(config)
+        self.decoder = ViTMAEDecoder(config, num_patches=self.vit.embeddings.num_patches)
+
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    def get_input_embeddings(self):
+        return self.vit.embeddings.patch_embeddings
+
+    def _prune_heads(self, heads_to_prune):
+        """
+        Prunes heads of the model. heads_to_prune: dict of {layer_num: list of heads to prune in this layer} See base
+        class PreTrainedModel
+        """
+        for layer, heads in heads_to_prune.items():
+            self.encoder.layer[layer].attention.prune_heads(heads)
+
+    def patchify(self, pixel_values, interpolate_pos_encoding: bool = False):
+        """
+        Args:
+            pixel_values (`torch.FloatTensor` of shape `(batch_size, num_channels, height, width)`):
+                Pixel values.
+            interpolate_pos_encoding (`bool`, *optional*, default `False`):
+                interpolation flag passed during the forward pass.
+
+        Returns:
+            `torch.FloatTensor` of shape `(batch_size, num_patches, patch_size**2 * num_channels)`:
+                Patchified pixel values.
+        """
+        patch_size, num_channels = self.config.patch_size, self.config.num_channels
+        # sanity checks
+        if not interpolate_pos_encoding and (
+            pixel_values.shape[2] != pixel_values.shape[3] or pixel_values.shape[2] % patch_size != 0
+        ):
+            raise ValueError("Make sure the pixel values have a squared size that is divisible by the patch size")
+        if pixel_values.shape[1] != num_channels:
+            raise ValueError(
+                "Make sure the number of channels of the pixel values is equal to the one set in the configuration"
+            )
+
+        # patchify
+        batch_size = pixel_values.shape[0]
+        num_patches_h = pixel_values.shape[2] // patch_size
+        num_patches_w = pixel_values.shape[3] // patch_size
+        patchified_pixel_values = pixel_values.reshape(
+            batch_size, num_channels, num_patches_h, patch_size, num_patches_w, patch_size
+        )
+        patchified_pixel_values = torch.einsum("nchpwq->nhwpqc", patchified_pixel_values)
+        patchified_pixel_values = patchified_pixel_values.reshape(
+            batch_size, num_patches_h * num_patches_w, patch_size**2 * num_channels
+        )
+        return patchified_pixel_values
+
+    def unpatchify(self, patchified_pixel_values, original_image_size: Optional[Tuple[int, int]] = None):
+        """
+        Args:
+            patchified_pixel_values (`torch.FloatTensor` of shape `(batch_size, num_patches, patch_size**2 * num_channels)`:
+                Patchified pixel values.
+            original_image_size (`Tuple[int, int]`, *optional*):
+                Original image size.
+
+        Returns:
+            `torch.FloatTensor` of shape `(batch_size, num_channels, height, width)`:
+                Pixel values.
+        """
+        patch_size, num_channels = self.config.patch_size, self.config.num_channels
+        original_image_size = (
+            original_image_size
+            if original_image_size is not None
+            else (self.config.image_size, self.config.image_size)
+        )
+        original_height, original_width = original_image_size
+        num_patches_h = original_height // patch_size
+        num_patches_w = original_width // patch_size
+        # sanity check
+        if num_patches_h * num_patches_w != patchified_pixel_values.shape[1]:
+            raise ValueError(
+                f"The number of patches in the patchified pixel values {patchified_pixel_values.shape[1]}, does not match the number of patches on original image {num_patches_h}*{num_patches_w}"
+            )
+
+        # unpatchify
+        batch_size = patchified_pixel_values.shape[0]
+        patchified_pixel_values = patchified_pixel_values.reshape(
+            batch_size,
+            num_patches_h,
+            num_patches_w,
+            patch_size,
+            patch_size,
+            num_channels,
+        )
+        patchified_pixel_values = torch.einsum("nhwpqc->nchpwq", patchified_pixel_values)
+        pixel_values = patchified_pixel_values.reshape(
+            batch_size,
+            num_channels,
+            num_patches_h * patch_size,
+            num_patches_w * patch_size,
+        )
+        return pixel_values
+
+    def forward_loss(self, pixel_values, pred, mask, interpolate_pos_encoding: bool = False):
+        """
+        Args:
+            pixel_values (`torch.FloatTensor` of shape `(batch_size, num_channels, height, width)`):
+                Pixel values.
+            pred (`torch.FloatTensor` of shape `(batch_size, num_patches, patch_size**2 * num_channels)`:
+                Predicted pixel values.
+            mask (`torch.FloatTensor` of shape `(batch_size, sequence_length)`):
+                Tensor indicating which patches are masked (1) and which are not (0).
+            interpolate_pos_encoding (`bool`, *optional*, default `False`):
+                interpolation flag passed during the forward pass.
+
+        Returns:
+            `torch.FloatTensor`: Pixel reconstruction loss.
+        """
+        target = self.patchify(pixel_values, interpolate_pos_encoding=interpolate_pos_encoding)
+        if self.config.norm_pix_loss:
+            mean = target.mean(dim=-1, keepdim=True)
+            var = target.var(dim=-1, keepdim=True)
+            target = (target - mean) / (var + 1.0e-6) ** 0.5
+
+        loss = (pred - target) ** 2
+        loss = loss.mean(dim=-1)  # [N, L], mean loss per patch
+        loss = (loss * mask).sum() / mask.sum()  # mean loss on removed patches
+        return loss
+
+    @auto_docstring
+    def forward(
+        self,
+        pixel_values: Optional[torch.FloatTensor] = None,
+        noise: Optional[torch.FloatTensor] = None,
+        head_mask: Optional[torch.FloatTensor] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        interpolate_pos_encoding: bool = False,
+    ) -> Union[Tuple, ViTMAEForPreTrainingOutput]:
+        r"""
+        interpolate_pos_encoding (`bool`, *optional*, default `False`):
+            Whether to interpolate the pre-trained position encodings. This is mainly used to use the model on higher
+            resolution images.
+        noise (`torch.FloatTensor` of shape `(batch_size, sequence_length)`, *optional*):
+            Mainly used for testing purposes to control randomness and maintain the reproducibility
+
+        Examples:
+
+        ```python
+        >>> from transformers import AutoImageProcessor, ViTMAEForPreTraining
+        >>> from PIL import Image
+        >>> import requests
+
+        >>> url = "http://images.cocodataset.org/val2017/000000039769.jpg"
+        >>> image = Image.open(requests.get(url, stream=True).raw)
+
+        >>> image_processor = AutoImageProcessor.from_pretrained("facebook/vit-mae-base")
+        >>> model = ViTMAEForPreTraining.from_pretrained("facebook/vit-mae-base")
+
+        >>> inputs = image_processor(images=image, return_tensors="pt")
+        >>> outputs = model(**inputs)
+        >>> loss = outputs.loss
+        >>> mask = outputs.mask
+        >>> ids_restore = outputs.ids_restore
+        ```"""
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        outputs = self.vit(
+            pixel_values,
+            noise=noise,
+            head_mask=head_mask,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            interpolate_pos_encoding=interpolate_pos_encoding,
+        )
+
+        latent = outputs.last_hidden_state
+        ids_restore = outputs.ids_restore
+        mask = outputs.mask
+
+        decoder_outputs = self.decoder(latent, ids_restore, interpolate_pos_encoding=interpolate_pos_encoding)
+        logits = decoder_outputs.logits  # shape (batch_size, num_patches, patch_size*patch_size*num_channels)
+
+        loss = self.forward_loss(pixel_values, logits, mask, interpolate_pos_encoding=interpolate_pos_encoding)
+
+        if not return_dict:
+            output = (logits, mask, ids_restore) + outputs[2:]
+            return ((loss,) + output) if loss is not None else output
+
+        return ViTMAEForPreTrainingOutput(
+            loss=loss,
+            logits=logits,
+            mask=mask,
+            ids_restore=ids_restore,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
+
+__all__ = ["ViTMAEForPreTraining", "ViTMAELayer", "ViTMAEModel", "ViTMAEPreTrainedModel"]
+ m o r e   c o n t r o l   o v e r   h o w   t o   c o n v e r t   * i n p u t _ i d s *   i n d i c e s   i n t o   a s s o c i a t e d   v e c t o r s   t h a n   t h e 
+                         m o d e l ' s   i n t e r n a l   e m b e d d i n g   l o o k u p   m a t r i x . 
+                 l a b e l s   ( ` t o r c h . L o n g T e n s o r `   o f   s h a p e   ` ( b a t c h _ s i z e , ) ` ,   * o p t i o n a l * ) : 
+                         L a b e l s   f o r   c o m p u t i n g   t h e   m u l t i p l e   c h o i c e   c l a s s i f i c a t i o n   l o s s .   I n d i c e s   s h o u l d   b e   i n   ` [ 0 ,   . . . , 
+                         n u m _ c h o i c e s - 1 ] `   w h e r e   ` n u m _ c h o i c e s `   i s   t h e   s i z e   o f   t h e   s e c o n d   d i m e n s i o n   o f   t h e   i n p u t   t e n s o r s .   ( S e e 
+                         ` i n p u t _ i d s `   a b o v e ) 
+                 " " " 
+                 r e t u r n _ d i c t   =   r e t u r n _ d i c t   i f   r e t u r n _ d i c t   i s   n o t   N o n e   e l s e   s e l f . c o n f i g . u s e _ r e t u r n _ d i c t 
+                 n u m _ c h o i c e s   =   i n p u t _ i d s . s h a p e [ 1 ]   i f   i n p u t _ i d s   i s   n o t   N o n e   e l s e   i n p u t s _ e m b e d s . s h a p e [ 1 ] 
+ 
+                 i n p u t _ i d s   =   i n p u t _ i d s . v i e w ( - 1 ,   i n p u t _ i d s . s i z e ( - 1 ) )   i f   i n p u t _ i d s   i s   n o t   N o n e   e l s e   N o n e 
+                 a t t e n t i o n _ m a s k   =   a t t e n t i o n _ m a s k . v i e w ( - 1 ,   a t t e n t i o n _ m a s k . s i z e ( - 1 ) )   i f   a t t e n t i o n _ m a s k   i s   n o t   N o n e   e l s e   N o n e 
+                 t o k e n _ t y p e _ i d s   =   t o k e n _ t y p e _ i d s . v i e w ( - 1 ,   t o k e n _ t y p e _ i d s . s i z e ( - 1 ) )   i f   t o k e n _ t y p e _ i d s   i s   n o t   N o n e   e l s e   N o n e 
+ 
+                 i n p u t s _ e m b e d s   =   ( 
+                         i n p u t s _ e m b e d s . v i e w ( - 1 ,   i n p u t s _ e m b e d s . s i z e ( - 2 ) ,   i n p u t s _ e m b e d s . s i z e ( - 1 ) ) 
+                         i f   i n p u t s _ e m b e d s   i s   n o t   N o n e 
+                         e l s e   N o n e 
+                 ) 
+ 
+                 o u t p u t s   =   s e l f . r o f o r m e r ( 
+                         i n p u t _ i d s , 
+                         a t t e n t i o n _ m a s k = a t t e n t i o n _ m a s k , 
+                         t o k e n _ t y p e _ i d s = t o k e n _ t y p e _ i d s , 
+                         h e a d _ m a s k = h e a d _ m a s k , 
+                         i n p u t s _ e m b e d s = i n p u t s _ e m b e d s , 
+                         o u t p u t _ a t t e n t i o n s = o u t p u t _ a t t e n t i o n s , 
+                         o u t p u t _ h i d d e n _ s t a t e s = o u t p u t _ h i d d e n _ s t a t e s , 
+                         r e t u r n _ d i c t = r e t u r n _ d i c t , 
+                 ) 
+ 
+                 s e q u e n c e _ o u t p u t   =   o u t p u t s [ 0 ] 
+ 
+                 p o o l e d _ o u t p u t   =   s e l f . s e q u e n c e _ s u m m a r y ( s e q u e n c e _ o u t p u t ) 
+                 l o g i t s   =   s e l f . c l a s s i f i e r ( p o o l e d _ o u t p u t ) 
+                 r e s h a p e d _ l o g i t s   =   l o g i t s . v i e w ( - 1 ,   n u m _ c h o i c e s ) 
+ 
+                 l o s s   =   N o n e 
+                 i f   l a b e l s   i s   n o t   N o n e : 
+                         l o s s _ f c t   =   C r o s s E n t r o p y L o s s ( ) 
+                         l o s s   =   l o s s _ f c t ( r e s h a p e d _ l o g i t s ,   l a b e l s ) 
+ 
+                 i f   n o t   r e t u r n _ d i c t : 
+                         o u t p u t   =   ( r e s h a p e d _ l o g i t s , )   +   o u t p u t s [ 1 : ] 
+                         r e t u r n   ( ( l o s s , )   +   o u t p u t )   i f   l o s s   i s   n o t   N o n e   e l s e   o u t p u t 
+ 
+                 r e t u r n   M u l t i p l e C h o i c e M o d e l O u t p u t ( 
+                         l o s s = l o s s , 
+                         l o g i t s = r e s h a p e d _ l o g i t s , 
+                         h i d d e n _ s t a t e s = o u t p u t s . h i d d e n _ s t a t e s , 
+                         a t t e n t i o n s = o u t p u t s . a t t e n t i o n s , 
+                 ) 
+ 
+ 
+ @ a u t o _ d o c s t r i n g 
+ c l a s s   R o F o r m e r F o r T o k e n C l a s s i f i c a t i o n ( R o F o r m e r P r e T r a i n e d M o d e l ) : 
+         d e f   _ _ i n i t _ _ ( s e l f ,   c o n f i g ) : 
+                 s u p e r ( ) . _ _ i n i t _ _ ( c o n f i g ) 
+                 s e l f . n u m _ l a b e l s   =   c o n f i g . n u m _ l a b e l s 
+ 
+                 s e l f . r o f o r m e r   =   R o F o r m e r M o d e l ( c o n f i g ) 
+                 s e l f . d r o p o u t   =   n n . D r o p o u t ( c o n f i g . h i d d e n _ d r o p o u t _ p r o b ) 
+                 s e l f . c l a s s i f i e r   =   n n . L i n e a r ( c o n f i g . h i d d e n _ s i z e ,   c o n f i g . n u m _ l a b e l s ) 
+ 
+                 #   I n i t i a l i z e   w e i g h t s   a n d   a p p l y   f i n a l   p r o c e s s i n g 
+                 s e l f . p o s t _ i n i t ( ) 
+ 
+         @ a u t o _ d o c s t r i n g 
+         d e f   f o r w a r d ( 
+                 s e l f , 
+                 i n p u t _ i d s :   O p t i o n a l [ t o r c h . L o n g T e n s o r ]   =   N o n e , 
+                 a t t e n t i o n _ m a s k :   O p t i o n a l [ t o r c h . F l o a t T e n s o r ]   =   N o n e , 
+                 t o k e n _ t y p e _ i d s :   O p t i o n a l [ t o r c h . L o n g T e n s o r ]   =   N o n e , 
+                 h e a d _ m a s k :   O p t i o n a l [ t o r c h . F l o a t T e n s o r ]   =   N o n e , 
+                 i n p u t s _ e m b e d s :   O p t i o n a l [ t o r c h . F l o a t T e n s o r ]   =   N o n e , 
+                 l a b e l s :   O p t i o n a l [ t o r c h . L o n g T e n s o r ]   =   N o n e , 
+                 o u t p u t _ a t t e n t i o n s :   O p t i o n a l [ b o o l ]   =   N o n e , 
+                 o u t p u t _ h i d d e n _ s t a t e s :   O p t i o n a l [ b o o l ]   =   N o n e , 
+                 r e t u r n _ d i c t :   O p t i o n a l [ b o o l ]   =   N o n e , 
+         )   - >   U n i o n [ T o k e n C l a s s i f i e r O u t p u t ,   T u p l e [ t o r c h . T e n s o r ] ] : 
+                 r " " " 
+                 l a b e l s   ( ` t o r c h . L o n g T e n s o r `   o f   s h a p e   ` ( b a t c h _ s i z e ,   s e q u e n c e _ l e n g t h ) ` ,   * o p t i o n a l * ) : 
+                         L a b e l s   f o r   c o m p u t i n g   t h e   t o k e n   c l a s s i f i c a t i o n   l o s s .   I n d i c e s   s h o u l d   b e   i n   ` [ 0 ,   . . . ,   c o n f i g . n u m _ l a b e l s   -   1 ] ` . 
+                 " " " 
+                 r e t u r n _ d i c t   =   r e t u r n _ d i c t   i f   r e t u r n _ d i c t   i s   n o t   N o n e   e l s e   s e l f . c o n f i g . u s e _ r e t u r n _ d i c t 
+ 
+                 o u t p u t s   =   s e l f . r o f o r m e r ( 
+                         i n p u t _ i d s , 
+                         a t t e n t i o n _ m a s k = a t t e n t i o n _ m a s k , 
+                         t o k e n _ t y p e _ i d s = t o k e n _ t y p e _ i d s , 
+                         h e a d _ m a s k = h e a d _ m a s k , 
+                         i n p u t s _ e m b e d s = i n p u t s _ e m b e d s , 
+                         o u t p u t _ a t t e n t i o n s = o u t p u t _ a t t e n t i o n s , 
+                         o u t p u t _ h i d d e n _ s t a t e s = o u t p u t _ h i d d e n _ s t a t e s , 
+                         r e t u r n _ d i c t = r e t u r n _ d i c t , 
+                 ) 
+ 
+                 s e q u e n c e _ o u t p u t   =   o u t p u t s [ 0 ] 
+ 
+                 s e q u e n c e _ o u t p u t   =   s e l f . d r o p o u t ( s e q u e n c e _ o u t p u t ) 
+                 l o g i t s   =   s e l f . c l a s s i f i e r ( s e q u e n c e _ o u t p u t ) 
+ 
+                 l o s s   =   N o n e 
+                 i f   l a b e l s   i s   n o t   N o n e : 
+                         l o s s _ f c t   =   C r o s s E n t r o p y L o s s ( ) 
+                         l o s s   =   l o s s _ f c t ( l o g i t s . v i e w ( - 1 ,   s e l f . n u m _ l a b e l s ) ,   l a b e l s . v i e w ( - 1 ) ) 
+ 
+                 i f   n o t   r e t u r n _ d i c t : 
+                         o u t p u t   =   ( l o g i t s , )   +   o u t p u t s [ 1 : ] 
+                         r e t u r n   ( ( l o s s , )   +   o u t p u t )   i f   l o s s   i s   n o t   N o n e   e l s e   o u t p u t 
+ 
+                 r e t u r n   T o k e n C l a s s i f i e r O u t p u t ( 
+                         l o s s = l o s s , 
+                         l o g i t s = l o g i t s , 
+                         h i d d e n _ s t a t e s = o u t p u t s . h i d d e n _ s t a t e s , 
+                         a t t e n t i o n s = o u t p u t s . a t t e n t i o n s , 
+                 ) 
+ 
+ 
+ @ a u t o _ d o c s t r i n g 
+ c l a s s   R o F o r m e r F o r Q u e s t i o n A n s w e r i n g ( R o F o r m e r P r e T r a i n e d M o d e l ) : 
+         d e f   _ _ i n i t _ _ ( s e l f ,   c o n f i g ) : 
+                 s u p e r ( ) . _ _ i n i t _ _ ( c o n f i g ) 
+ 
+                 c o n f i g . n u m _ l a b e l s   =   2 
+                 s e l f . n u m _ l a b e l s   =   c o n f i g . n u m _ l a b e l s 
+ 
+                 s e l f . r o f o r m e r   =   R o F o r m e r M o d e l ( c o n f i g ) 
+                 s e l f . q a _ o u t p u t s   =   n n . L i n e a r ( c o n f i g . h i d d e n _ s i z e ,   c o n f i g . n u m _ l a b e l s ) 
+ 
+                 #   I n i t i a l i z e   w e i g h t s   a n d   a p p l y   f i n a l   p r o c e s s i n g 
+                 s e l f . p o s t _ i n i t ( ) 
+ 
+         @ a u t o _ d o c s t r i n g 
+         d e f   f o r w a r d ( 
+                 s e l f , 
+                 i n p u t _ i d s :   O p t i o n a l [ t o r c h . L o n g T e n s o r ]   =   N o n e , 
+                 a t t e n t i o n _ m a s k :   O p t i o n a l [ t o r c h . F l o a t T e n s o r ]   =   N o n e , 
+                 t o k e n _ t y p e _ i d s :   O p t i o n a l [ t o r c h . L o n g T e n s o r ]   =   N o n e , 
+                 h e a d _ m a s k :   O p t i o n a l [ t o r c h . F l o a t T e n s o r ]   =   N o n e , 
+                 i n p u t s _ e m b e d s :   O p t i o n a l [ t o r c h . F l o a t T e n s o r ]   =   N o n e , 
+                 s t a r t _ p o s i t i o n s :   O p t i o n a l [ t o r c h . L o n g T e n s o r ]   =   N o n e , 
+                 e n d _ p o s i t i o n s :   O p t i o n a l [ t o r c h . L o n g T e n s o r ]   =   N o n e , 
+                 o u t p u t _ a t t e n t i o n s :   O p t i o n a l [ b o o l ]   =   N o n e , 
+                 o u t p u t _ h i d d e n _ s t a t e s :   O p t i o n a l [ b o o l ]   =   N o n e , 
+                 r e t u r n _ d i c t :   O p t i o n a l [ b o o l ]   =   N o n e , 
+         )   - >   U n i o n [ Q u e s t i o n A n s w e r i n g M o d e l O u t p u t ,   T u p l e [ t o r c h . T e n s o r ] ] : 
+                 r e t u r n _ d i c t   =   r e t u r n _ d i c t   i f   r e t u r n _ d i c t   i s   n o t   N o n e   e l s e   s e l f . c o n f i g . u s e _ r e t u r n _ d i c t 
+ 
+                 o u t p u t s   =   s e l f . r o f o r m e r ( 
+                         i n p u t _ i d s , 
+                         a t t e n t i o n _ m a s k = a t t e n t i o n _ m a s k , 
+                         t o k e n _ t y p e _ i d s = t o k e n _ t y p e _ i d s , 
+                         h e a d _ m a s k = h e a d _ m a s k , 
+                         i n p u t s _ e m b e d s = i n p u t s _ e m b e d s , 
+                         o u t p u t _ a t t e n t i o n s = o u t p u t _ a t t e n t i o n s , 
+                         o u t p u t _ h i d d e n _ s t a t e s = o u t p u t _ h i d d e n _ s t a t e s , 
+                         r e t u r n _ d i c t = r e t u r n _ d i c t , 
+                 ) 
+ 
+                 s e q u e n c e _ o u t p u t   =   o u t p u t s [ 0 ] 
+ 
+                 l o g i t s   =   s e l f . q a _ o u t p u t s ( s e q u e n c e _ o u t p u t ) 
+                 s t a r t _ l o g i t s ,   e n d _ l o g i t s   =   l o g i t s . s p l i t ( 1 ,   d i m = - 1 ) 
+                 s t a r t _ l o g i t s   =   s t a r t _ l o g i t s . s q u e e z e ( - 1 ) 
+                 e n d _ l o g i t s   =   e n d _ l o g i t s . s q u e e z e ( - 1 ) 
+ 
+                 t o t a l _ l o s s   =   N o n e 
+                 i f   s t a r t _ p o s i t i o n s   i s   n o t   N o n e   a n d   e n d _ p o s i t i o n s   i s   n o t   N o n e : 
+                         #   I f   w e   a r e   o n   m u l t i - G P U ,   s p l i t   a d d   a   d i m e n s i o n 
+                         i f   l e n ( s t a r t _ p o s i t i o n s . s i z e ( ) )   >   1 : 
+                                 s t a r t _ p o s i t i o n s   =   s t a r t _ p o s i t i o n s . s q u e e z e ( - 1 ) 
+                         i f   l e n ( e n d _ p o s i t i o n s . s i z e ( ) )   >   1 : 
+                                 e n d _ p o s i t i o n s   =   e n d _ p o s i t i o n s . s q u e e z e ( - 1 ) 
+                         #   s o m e t i m e s   t h e   s t a r t / e n d   p o s i t i o n s   a r e   o u t s i d e   o u r   m o d e l   i n p u t s ,   w e   i g n o r e   t h e s e   t e r m s 
+                         i g n o r e d _ i n d e x   =   s t a r t _ l o g i t s . s i z e ( 1 ) 
+                         s t a r t _ p o s i t i o n s   =   s t a r t _ p o s i t i o n s . c l a m p ( 0 ,   i g n o r e d _ i n d e x ) 
+                         e n d _ p o s i t i o n s   =   e n d _ p o s i t i o n s . c l a m p ( 0 ,   i g n o r e d _ i n d e x ) 
+ 
+                         l o s s _ f c t   =   C r o s s E n t r o p y L o s s ( i g n o r e _ i n d e x = i g n o r e d _ i n d e x ) 
+                         s t a r t _ l o s s   =   l o s s _ f c t ( s t a r t _ l o g i t s ,   s t a r t _ p o s i t i o n s ) 
+                         e n d _ l o s s   =   l o s s _ f c t ( e n d _ l o g i t s ,   e n d _ p o s i t i o n s ) 
+                         t o t a l _ l o s s   =   ( s t a r t _ l o s s   +   e n d _ l o s s )   /   2 
+ 
+                 i f   n o t   r e t u r n _ d i c t : 
+                         o u t p u t   =   ( s t a r t _ l o g i t s ,   e n d _ l o g i t s )   +   o u t p u t s [ 1 : ] 
+                         r e t u r n   ( ( t o t a l _ l o s s , )   +   o u t p u t )   i f   t o t a l _ l o s s   i s   n o t   N o n e   e l s e   o u t p u t 
+ 
+                 r e t u r n   Q u e s t i o n A n s w e r i n g M o d e l O u t p u t ( 
+                         l o s s = t o t a l _ l o s s , 
+                         s t a r t _ l o g i t s = s t a r t _ l o g i t s , 
+                         e n d _ l o g i t s = e n d _ l o g i t s , 
+                         h i d d e n _ s t a t e s = o u t p u t s . h i d d e n _ s t a t e s , 
+                         a t t e n t i o n s = o u t p u t s . a t t e n t i o n s , 
+                 ) 
+ 
+ 
+ _ _ a l l _ _   =   [ 
+         " R o F o r m e r F o r C a u s a l L M " , 
+         " R o F o r m e r F o r M a s k e d L M " , 
+         " R o F o r m e r F o r M u l t i p l e C h o i c e " , 
+         " R o F o r m e r F o r Q u e s t i o n A n s w e r i n g " , 
+         " R o F o r m e r F o r S e q u e n c e C l a s s i f i c a t i o n " , 
+         " R o F o r m e r F o r T o k e n C l a s s i f i c a t i o n " , 
+         " R o F o r m e r L a y e r " , 
+         " R o F o r m e r M o d e l " , 
+         " R o F o r m e r P r e T r a i n e d M o d e l " , 
+         " l o a d _ t f _ w e i g h t s _ i n _ r o f o r m e r " , 
+ ] 
+   ut_ids is not None:
+            self.warn_if_padding_and_no_attention_mask(inp  _ids, attention_mask)
+            input_shape = input_ids.size()
+        elif inputs_embeds is not None:
+            input_shape = inputs_embeds.size()[:-1]
+        else:
+            raise ValueError("You have to specify either input_ids or inputs_embeds")
+
+        batch_size, seq_length = input_shape
+        device = input_ids.device if input_ids is not None else inputs_embeds.device
+
+        # past_key_values_length
+        past_key_values_length = past_key_values[0][0].shape[2] if past_key_values is not None else 0
+
+        if attention_mask is None:
+            attention_mask = torch.ones(((batch_size, seq_length + past_key_values_length)), device=device)
+        if token_type_ids is None:
+            token_type_ids = torch.zeros(input_shape, dtype=torch.long, device=device)
+
+        # We can provide a self-attention mask of dimensions [batch_size, from_seq_length, to_seq_length]
+        # ourselves in which case we just need to make it broadcastable to all heads.
+        extended_attention_mask: torch.Tensor = self.get_extended_attention_mask(attention_mask, input_shape)
+
+        # If a 2D or 3D attention mask is provided for the cross-attention
+        # we need to make broadcastable to [batch_size, num_heads, seq_length, seq_length]
+        if self.config.is_decoder and encoder_hidden_states is not None:
+            encoder_batch_size, encoder_sequence_length, _ = encoder_hidden_states.size()
+            encoder_hidden_shape = (encoder_batch_size, encoder_sequence_length)
+            if encoder_attention_mask is None:
+                encoder_attention_mask = torch.ones(encoder_hidden_shape, device=device)
+            encoder_extended_attention_mask = self.invert_attention_mask(encoder_attention_mask)
+        else:
+            encoder_extended_attention_mask = None
+
+        # Prepare head mask if needed
+        # 1.0 in head_mask indicate we keep the head
+        # attention_probs has shape bsz x n_heads x N x N
+        # input head_mask has shape [num_heads] or [num_hidden_layers x num_heads]
+        # and head_mask is converted to shape [num_hidden_layers x batch x num_heads x seq_length x seq_length]
+        head_mask = self.get_head_mask(head_mask, self.config.num_hidden_layers)
+
+        embedding_output = self.embeddings(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            token_type_ids=token_type_ids,
+            inputs_embeds=inputs_embeds,
+            past_key_values_length=past_key_values_length,
+        )
+        encoder_outputs = self.encoder(
+            embedding_output,
+            attention_mask=extended_attention_mask,
+            head_mask=head_mask,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_attention_mask=encoder_extended_attention_mask,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+        sequence_output = encoder_outputs[0]
+        pooled_output = self.pooler(sequence_output) if self.pooler is not None else None
+
+        if not return_dict:
+            return (sequence_output, pooled_output) + encoder_outputs[1:]
+
+        return BaseModelOutputWithPoolingAndCrossAttentions(
+            last_hidden_state=sequence_output,
+            pooler_output=pooled_output,
+            past_key_values=encoder_outputs.past_key_values,
+            hidden_states=encoder_outputs.hidden_states,
+            attentions=encoder_outputs.attentions,
+            cross_attentions=encoder_outputs.cross_attentions,
+        )
+
+
+@auto_docstring
+class RemBertForMaskedLM(RemBertPreTrainedModel):
+    _tied_weights_keys = ["cls.predictions.decoder.weight"]
+
+    def __init__(self, config):
+        super().__init__(config)
+
+        if config.is_decoder:
+            logger.warning(
+                "If you want to use `RemBertForMaskedLM` make sure `config.is_decoder=False` for "
+                "bi-directional self-attention."
+            )
+
+        self.rembert = RemBertModel(config, add_pooling_layer=False)
+        self.cls = RemBertOnlyMLMHead(config)
+
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    def get_output_embeddings(self):
+        return self.cls.predictions.decoder
+
+    def set_output_embeddings(self, new_embeddings):
+        self.cls.predictions.decoder = new_embeddings
+
+    @auto_docstring
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.LongTensor] = None,
+        token_type_ids: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        head_mask: Optional[torch.FloatTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        encoder_hidden_states: Optional[torch.FloatTensor] = None,
+        encoder_attention_mask: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+    ) -> Union[Tuple, MaskedLMOutput]:
+        r"""
+        labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+            Labels for computing the masked language modeling loss. Indices should be in `[-100, 0, ...,
+            config.vocab_size]` (see `input_ids` docstring) Tokens with indices set to `-100` are ignored (masked), the
+            loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
+        """
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        outputs = self.rembert(
+            input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            head_mask=head_mask,
+            inputs_embeds=inputs_embeds,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_attention_mask=encoder_attention_mask,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+        sequence_output = outputs[0]
+        prediction_scores = self.cls(sequence_output)
+
+        masked_lm_loss = None
+        if labels is not None:
+            loss_fct = CrossEntropyLoss()  # -100 index = padding token
+            masked_lm_loss = loss_fct(prediction_scores.view(-1, self.config.vocab_size), labels.view(-1))
+
+        if not return_dict:
+            output = (prediction_scores,) + outputs[2:]
+            return ((masked_lm_loss,) + output) if masked_lm_loss is not None else output
+
+        return MaskedLMOutput(
+            loss=masked_lm_loss,
+            logits=prediction_scores,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
+    def prepare_inputs_for_generation(self, input_ids, attention_mask=None, **model_kwargs):
+        input_shape = input_ids.shape
+        effective_batch_size = input_shape[0]
+
+        #  add a dummy token
+        assert self.config.pad_token_id is not None, "The PAD token should be defined for generation"
+        attention_mask = torch.cat([attention_mask, attention_mask.new_zeros((attention_mask.shape[0], 1))], dim=-1)
+        dummy_token = torch.full(
+            (effective_batch_size, 1), self.config.pad_token_id, dtype=torch.long, device=input_ids.device
+        )
+        input_ids = torch.cat([input_ids, dummy_token], dim=1)
+
+        return {"input_ids": input_ids, "attention_mask": attention_mask}
+
+    @classmethod
+    def can_generate(cls) -> bool:
+        """
+        Legacy correction: RemBertForMaskedLM can't call `generate()` from `GenerationMixin`, even though it has a
+        `prepare_inputs_for_generation` method.
+        """
+        return False
+
+
+@auto_docstring(
+    custom_intro="""
+    RemBERT Model with a `language modeling` head on top

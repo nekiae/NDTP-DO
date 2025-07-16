@@ -1,0 +1,1 @@
+WARNING:aiogram.dispatcher:Received SIGTERM signal

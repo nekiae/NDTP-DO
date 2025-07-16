@@ -1,25 +1,65 @@
 import os
 import logging
+import sys
 from typing import Optional
 import asyncio
 import time
 from datetime import datetime
 from dotenv import load_dotenv
 
+# Настройка логирования (ВАЖНО: настраиваем ПЕРЕД импортом модулей)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+    datefmt='%H:%M:%S'
+)
+
+# Настройка уровней логирования для разных модулей
+logging.getLogger('aiogram.dispatcher').setLevel(logging.WARNING)
+logging.getLogger('aiogram.bot').setLevel(logging.WARNING)
+logging.getLogger('aiohttp').setLevel(logging.WARNING)
+logging.getLogger('httpx').setLevel(logging.WARNING)
+
+logger = logging.getLogger(__name__)
+
 import aiohttp
-from aiogram import Bot, Dispatcher, types, F
+from aiogram import Bot, Dispatcher, types, F, BaseMiddleware
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 
+# Новые импорты для улучшений
+import re
+from tenacity import retry, wait_exponential, stop_after_attempt
+
+# Безопасный импорт dateparser
+try:
+    import dateparser
+    DATEPARSER_AVAILABLE = True
+    logger.info("✅ dateparser успешно импортирован")
+except ImportError:
+    DATEPARSER_AVAILABLE = False
+    logger.warning("⚠️ dateparser недоступен - используется fallback regex")
+
+# Безопасный импорт redis с обработкой совместимости
+try:
+    import redis.asyncio as redis
+    REDIS_AVAILABLE = True
+    logger.info("✅ redis.asyncio успешно импортирован")
+except ImportError:
+    REDIS_AVAILABLE = False
+    logger.warning("⚠️ redis недоступен - используется локальный кэш лимитов")
+    redis = None
+except Exception as e:
+    REDIS_AVAILABLE = False
+    logger.warning(f"⚠️ Ошибка импорта redis: {e}")
+    logger.info("💡 Используется локальный кэш лимитов")
+    redis = None
+
 # Загрузка переменных окружения
 load_dotenv()
-
-# Настройка логирования (ВАЖНО: настраиваем ПЕРЕД импортом модулей)
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 # Импорт собственных модулей
 from operator_handler import operator_handler, OperatorState, UserStatus
@@ -64,35 +104,231 @@ except ImportError as e:
     logger.warning(f"⚠️ Система уведомлений недоступна: {e}")
     NOTIFICATIONS_AVAILABLE = False
 
-# Добавляем импорт оптимизированной RAG системы
+# Импорт квиз модуля
 try:
-    from optimized_rag_system import (
-        get_optimized_context_async, 
-        get_optimized_context, 
-        get_optimized_rag, 
-        RAGModes
-    )
-    # Инициализируем в экономном режиме
-    optimized_rag = get_optimized_rag(RAGModes.ECONOMY)
-    OPTIMIZED_RAG_AVAILABLE = True
-    logger.info(f"🚀 Оптимизированная RAG система готова: {optimized_rag.get_stats()}")
+    from quiz_mod import register_quiz_handlers, get_quiz_stats, quiz_start_callback
+    QUIZ_AVAILABLE = True
+    logger.info("🎯 Квиз модуль загружен")
 except ImportError as e:
-    logger.warning(f"⚠️ Оптимизированная RAG система недоступна: {e}")
-    OPTIMIZED_RAG_AVAILABLE = False
+    logger.warning(f"⚠️ Квиз модуль недоступен: {e}")
+    QUIZ_AVAILABLE = False
 
-# Резервная загрузка современной RAG системы
-try:
-    from modern_rag_system import ModernRAGSystem, get_context_for_query_async, set_global_instance
-    modern_rag = ModernRAGSystem()
-    modern_rag.load_and_index_knowledge()
-    set_global_instance(modern_rag)  # Устанавливаем глобальную инстанцию
-    MODERN_RAG_AVAILABLE = True
-    logger.info(f"📚 Резервная RAG система готова: {modern_rag.get_stats()['total_documents']} документов")
-except ImportError as e:
-    logger.warning(f"⚠️ Современная RAG система недоступна: {e}")
-    logger.info("📚 Используем базовую RAG систему")
-    MODERN_RAG_AVAILABLE = False
-    modern_rag = None
+# Глобальные переменные для RAG систем (инициализируются лениво)
+optimized_rag = None
+modern_rag = None
+OPTIMIZED_RAG_AVAILABLE = False
+MODERN_RAG_AVAILABLE = False
+
+# Флаги готовности RAG систем
+rag_systems_ready = {
+    'optimized': False,
+    'modern': False
+}
+
+async def init_optimized_rag():
+    """Ленивая инициализация оптимизированной RAG системы"""
+    global optimized_rag, OPTIMIZED_RAG_AVAILABLE
+    try:
+        logger.info("🚀 Инициализация оптимизированной RAG системы...")
+        from optimized_rag_system import get_optimized_rag, RAGModes
+        
+        loop = asyncio.get_running_loop()
+        optimized_rag = await loop.run_in_executor(
+            None, lambda: get_optimized_rag(RAGModes.ECONOMY)
+        )
+        
+        OPTIMIZED_RAG_AVAILABLE = True
+        rag_systems_ready['optimized'] = True
+        logger.info(f"✅ Оптимизированная RAG система готова: {optimized_rag.get_stats()}")
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка инициализации оптимизированной RAG: {e}")
+        OPTIMIZED_RAG_AVAILABLE = False
+
+async def init_modern_rag():
+    """Ленивая инициализация современной RAG системы"""
+    global modern_rag, MODERN_RAG_AVAILABLE
+    try:
+        logger.info("📚 Инициализация современной RAG системы...")
+        from modern_rag_system import ModernRAGSystem, set_global_instance
+        
+        loop = asyncio.get_running_loop()
+        
+        # Создаем и инициализируем RAG систему в отдельном потоке
+        def create_and_init_rag():
+            rag = ModernRAGSystem()
+            rag.load_and_index_knowledge()
+            return rag
+        
+        modern_rag = await loop.run_in_executor(None, create_and_init_rag)
+        set_global_instance(modern_rag)
+        
+        MODERN_RAG_AVAILABLE = True
+        rag_systems_ready['modern'] = True
+        stats = modern_rag.get_stats()
+        logger.info(f"✅ Современная RAG система готова: {stats['total_documents']} документов")
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка инициализации современной RAG: {e}")
+        MODERN_RAG_AVAILABLE = False
+
+# ========================================
+# 🔧 УЛУЧШЕНИЯ: Парсинг дат и лимиты API
+# ========================================
+
+# Словарь для надёжного парсинга русских месяцев
+MONTHS_PATTERNS = {
+    r'январ\w*': 1, r'феврал\w*': 2, r'март\w*': 3,
+    r'апрел\w*': 4, r'ма[йя]\w*': 5, r'июн\w*': 6,
+    r'июл\w*': 7, r'август\w*': 8, r'сентябр\w*': 9,
+    r'октябр\w*': 10, r'ноябр\w*': 11, r'декабр\w*': 12,
+}
+
+# Компилируем regex для парсинга дат
+DATE_REGEX = re.compile(
+    rf'(?P<day>\d{{1,2}})\s+(?P<month>{"|".join(MONTHS_PATTERNS)})\s*(?P<year>\d{{4}})?',
+    re.IGNORECASE | re.UNICODE,
+)
+
+def parse_russian_date(text: str, default_year: int = None) -> Optional[datetime]:
+    """
+    Надёжный парсер русских дат с fallback на dateparser
+    
+    Args:
+        text: Текст содержащий дату
+        default_year: Год по умолчанию, если не указан
+    
+    Returns:
+        datetime объект или None если дата не найдена
+    """
+    if not text:
+        return None
+    
+    # Очищаем текст от лишних пробелов
+    clean_text = re.sub(r'\s+', ' ', text.strip())
+    
+    # Сначала пробуем dateparser (надёжнее), если доступен
+    if DATEPARSER_AVAILABLE:
+        try:
+            dt = dateparser.parse(
+                clean_text,
+                languages=['ru'],
+                settings={
+                    'DATE_ORDER': 'DMY',
+                    'PREFER_DAY_OF_MONTH': 'first'
+                }
+            )
+            if dt:
+                return dt
+        except Exception as e:
+            logger.warning(f"⚠️ dateparser не смог распарсить '{clean_text}': {e}")
+    
+    # Fallback на собственный regex
+    try:
+        match = DATE_REGEX.search(clean_text)
+        if match:
+            day = int(match.group('day'))
+            month_text = match.group('month')
+            year = int(match.group('year') or default_year or datetime.now().year)
+            
+            # Находим номер месяца
+            month = None
+            for pattern, num in MONTHS_PATTERNS.items():
+                if re.fullmatch(pattern, month_text, re.IGNORECASE):
+                    month = num
+                    break
+            
+            if month:
+                return datetime(year, month, day)
+    except Exception as e:
+        logger.warning(f"⚠️ Regex не смог распарсить '{clean_text}': {e}")
+    
+    return None
+
+# Инициализация Redis для лимитов
+redis_client = None
+if REDIS_AVAILABLE:
+    try:
+        # Отложенная инициализация Redis - создаем соединение только при первом использовании
+        logger.info("🔴 Redis модуль готов к использованию")
+    except Exception as e:
+        logger.warning(f"⚠️ Redis модуль недоступен: {e}")
+        REDIS_AVAILABLE = False
+
+# Семафор для ограничения одновременных LLM запросов
+LLM_CONCURRENCY = 10
+llm_semaphore = asyncio.Semaphore(LLM_CONCURRENCY)
+
+class HourlyLimitMiddleware(BaseMiddleware):
+    """Middleware для ограничения количества запросов в час с улучшенной Redis поддержкой"""
+    
+    def __init__(self, limit_per_hour: int = 50):
+        self.limit = limit_per_hour
+        self.fallback_cache = {}  # Fallback для случая без Redis
+        self._redis_client = None
+        
+    async def __call__(self, handler, event, data):
+        if not hasattr(event, 'from_user') or not event.from_user:
+            return await handler(event, data)
+        
+        user_id = event.from_user.id
+        
+        # Используем Redis если доступен
+        if REDIS_AVAILABLE and redis is not None:
+            try:
+                # Создаем соединение Redis только при необходимости
+                if self._redis_client is None:
+                    self._redis_client = redis.from_url("redis://localhost", decode_responses=True)
+                
+                key = f"user:{user_id}:quota"
+                used = await self._redis_client.incr(key)
+                if used == 1:
+                    await self._redis_client.expire(key, 3600)  # TTL 1 час
+                
+                if used > self.limit:
+                    ttl = await self._redis_client.ttl(key)
+                    await event.answer(
+                        "⌛ Вы исчерпали лимит запросов в час.\n"
+                        f"Попробуйте через {ttl if ttl > 0 else 3600} секунд."
+                    )
+                    return
+                    
+                # Логируем близкие к лимиту запросы
+                if used > self.limit * 0.8:
+                    logger.warning(f"⚠️ Пользователь {user_id} близок к лимиту: {used}/{self.limit}")
+                
+                # Успешно использовали Redis, выходим
+                return await handler(event, data)
+                    
+            except Exception as e:
+                logger.warning(f"⚠️ Redis недоступен: {e}")
+                # Fallback на локальный кэш
+                self._redis_client = None
+        
+        # Fallback: простой локальный кэш
+        current_time = time.time()
+        current_hour = int(current_time // 3600)
+        
+        if user_id not in self.fallback_cache:
+            self.fallback_cache[user_id] = {'hour': current_hour, 'count': 0}
+        
+        user_data = self.fallback_cache[user_id]
+        
+        # Сброс счётчика при смене часа
+        if user_data['hour'] != current_hour:
+            user_data['hour'] = current_hour
+            user_data['count'] = 0
+        
+        user_data['count'] += 1
+        
+        if user_data['count'] > self.limit:
+            await event.answer(
+                "⌛ Вы исчерпали лимит запросов в час.\n"
+                "Попробуйте через час."
+            )
+            return
+        
+        return await handler(event, data)
 
 # Конфигурация
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -160,10 +396,18 @@ if not BOT_TOKEN:
 if not DEEPSEEK_API_KEY:
     raise ValueError("DEEPSEEK_API_KEY не найден в переменных окружения")
 
-# Инициализация бота и диспетчера
+    # Инициализация бота и диспетчера
+logger.info("🤖 Создание экземпляра бота...")
 bot = Bot(token=BOT_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
+logger.info("✅ Бот и диспетчер инициализированы")
+
+# Добавляем middleware для лимитов API
+logger.info("🛡️ Установка middleware для лимитов API...")
+dp.message.middleware(HourlyLimitMiddleware(limit_per_hour=50))
+dp.callback_query.middleware(HourlyLimitMiddleware(limit_per_hour=50))
+logger.info("✅ Middleware установлен (50 запросов/час)")
 
 # Состояния FSM (дополнительные к OperatorState)
 class UserState(StatesGroup):
@@ -180,34 +424,58 @@ class DeepSeekAPI:
             "Content-Type": "application/json"
         }
 
+    @retry(
+        wait=wait_exponential(multiplier=1, min=2, max=60),
+        stop=stop_after_attempt(5)
+    )
+    async def _make_request(self, payload: dict) -> Optional[dict]:
+        """Защищённый HTTP запрос с retry логикой"""
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                DEEPSEEK_API_URL,
+                headers=self.headers,
+                json=payload
+            ) as response:
+                if response.status == 200:
+                    return await response.json()
+                elif response.status == 429:
+                    retry_after = response.headers.get('Retry-After', '60')
+                    logger.warning(f"⚠️ Rate limit (429), retry after {retry_after}s")
+                    raise aiohttp.ClientResponseError(
+                        response.request_info,
+                        response.history,
+                        status=429,
+                        message=f"Rate limit exceeded, retry after {retry_after}s"
+                    )
+                else:
+                    logger.error(f"❌ DeepSeek API error: {response.status}")
+                    response.raise_for_status()
+
     async def get_completion(self, messages: list, temperature: float = 0.7) -> Optional[str]:
+        """Получить обычный ответ от DeepSeek с защитой от перегрузки"""
         try:
-            async with aiohttp.ClientSession() as session:
+            # Используем семафор для ограничения одновременных запросов
+            async with llm_semaphore:
                 payload = {
                     "model": "deepseek-chat",
                     "messages": messages,
                     "temperature": temperature
                 }
                 
-                async with session.post(
-                    DEEPSEEK_API_URL,
-                    headers=self.headers,
-                    json=payload
-                ) as response:
-                    if response.status == 200:
-                        result = await response.json()
-                        return result["choices"][0]["message"]["content"]
-                    else:
-                        logger.error(f"DeepSeek API error: {response.status}")
-                        return None
+                result = await self._make_request(payload)
+                if result:
+                    return result["choices"][0]["message"]["content"]
+                return None
+                
         except Exception as e:
-            logger.error(f"Error in DeepSeek API call: {e}")
+            logger.error(f"❌ Error in DeepSeek API call: {e}")
             return None
 
     async def get_streaming_completion(self, messages: list, temperature: float = 0.7):
-        """Генератор для стриминговых ответов от DeepSeek API"""
+        """Генератор для стриминговых ответов с защитой от перегрузки"""
         try:
-            async with aiohttp.ClientSession() as session:
+            # Используем семафор для ограничения одновременных запросов
+            async with llm_semaphore:
                 payload = {
                     "model": "deepseek-chat", 
                     "messages": messages,
@@ -215,36 +483,64 @@ class DeepSeekAPI:
                     "stream": True
                 }
                 
-                async with session.post(
-                    DEEPSEEK_API_URL,
-                    headers=self.headers,
-                    json=payload
-                ) as response:
-                    if response.status == 200:
-                        async for line in response.content:
-                            line = line.decode('utf-8').strip()
-                            if line.startswith('data: '):
-                                line = line[6:]  # Убираем 'data: '
-                                if line == '[DONE]':
-                                    break
-                                try:
-                                    import json
-                                    data = json.loads(line)
-                                    if 'choices' in data and len(data['choices']) > 0:
-                                        delta = data['choices'][0].get('delta', {})
-                                        if 'content' in delta:
-                                            yield delta['content']
-                                except json.JSONDecodeError:
+                # Повторяем попытки при ошибках
+                for attempt in range(3):
+                    try:
+                        async with aiohttp.ClientSession() as session:
+                            async with session.post(
+                                DEEPSEEK_API_URL,
+                                headers=self.headers,
+                                json=payload
+                            ) as response:
+                                if response.status == 429:
+                                    retry_after = int(response.headers.get('Retry-After', '60'))
+                                    logger.warning(f"⚠️ Rate limit при стриминге, ждём {retry_after}s")
+                                    await asyncio.sleep(retry_after)
                                     continue
-                    else:
-                        logger.error(f"DeepSeek API streaming error: {response.status}")
-                        yield None
+                                
+                                if response.status == 200:
+                                    async for line in response.content:
+                                        line = line.decode('utf-8').strip()
+                                        if line.startswith('data: '):
+                                            line = line[6:]
+                                            if line == '[DONE]':
+                                                break
+                                            try:
+                                                import json
+                                                data = json.loads(line)
+                                                if 'choices' in data and len(data['choices']) > 0:
+                                                    delta = data['choices'][0].get('delta', {})
+                                                    if 'content' in delta:
+                                                        yield delta['content']
+                                            except json.JSONDecodeError:
+                                                continue
+                                    return
+                                else:
+                                    logger.error(f"❌ DeepSeek streaming error: {response.status}")
+                                    if attempt < 2:
+                                        await asyncio.sleep(2 ** attempt)
+                                        continue
+                                    else:
+                                        yield None
+                                        return
+                                        
+                    except Exception as e:
+                        logger.error(f"❌ Streaming attempt {attempt + 1} failed: {e}")
+                        if attempt < 2:
+                            await asyncio.sleep(2 ** attempt)
+                            continue
+                        else:
+                            yield None
+                            return
+                            
         except Exception as e:
-            logger.error(f"Error in DeepSeek streaming API call: {e}")
+            logger.error(f"❌ Error in DeepSeek streaming API call: {e}")
             yield None
 
 # Инициализация DeepSeek API
+logger.info("🧠 Инициализация DeepSeek API...")
 deepseek = DeepSeekAPI(DEEPSEEK_API_KEY)
+logger.info("✅ DeepSeek API готов к работе")
 
 
 
@@ -252,12 +548,14 @@ deepseek = DeepSeekAPI(DEEPSEEK_API_KEY)
 async def get_enhanced_context(query: str) -> str:
     """Получает контекст из RAG системы, обогащенный актуальной информацией"""
     try:
-        # ПРИОРИТЕТ: Современная RAG система
-        if MODERN_RAG_AVAILABLE:
+        # ПРИОРИТЕТ: Современная RAG система (если готова)
+        if MODERN_RAG_AVAILABLE and rag_systems_ready['modern']:
             logger.info("📚 Используем современную векторную RAG систему")
+            from modern_rag_system import get_context_for_query_async
             base_context = await get_context_for_query_async(query)
-        elif OPTIMIZED_RAG_AVAILABLE:
+        elif OPTIMIZED_RAG_AVAILABLE and rag_systems_ready['optimized']:
             logger.info("🚀 Используем оптимизированную RAG систему")
+            from optimized_rag_system import get_optimized_context_async, RAGModes
             base_context = await get_optimized_context_async(query, RAGModes.ECONOMY)
         else:
             logger.info("📖 Используем базовую RAG систему")
@@ -324,6 +622,10 @@ async def get_enhanced_context(query: str) -> str:
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     """Приветственное сообщение с инлайн кнопками"""
+    user_id = message.from_user.id
+    username = message.from_user.username or "без username"
+    logger.info(f"🎯 Команда /start от пользователя {user_id} (@{username})")
+    
     welcome_text = (
         "👋 Добро пожаловать в бот Национального детского технопарка!\n\n"
         "🤖 Я ваш интеллектуальный помощник. Выберите интересующую вас тему:"
@@ -352,6 +654,12 @@ async def cmd_start(message: Message):
             InlineKeyboardButton(text="📋 Проверить списки", callback_data="check_lists")
         ])
     
+    # Добавляем кнопку квиза, если модуль доступен
+    if QUIZ_AVAILABLE:
+        keyboard_rows.append([
+            InlineKeyboardButton(text="🎯 Квиз: подбор направления", callback_data="start_quiz")
+        ])
+    
     keyboard_rows.append([
         InlineKeyboardButton(text="👨‍💼 Связаться с консультантом", callback_data="request_consultant")
     ])
@@ -363,6 +671,8 @@ async def cmd_start(message: Message):
 @dp.message(Command("help"))
 async def cmd_help(message: Message, state: FSMContext):
     user_id = message.from_user.id
+    username = message.from_user.username or "без username"
+    logger.info(f"🆘 Команда /help от пользователя {user_id} (@{username}) - запрос консультанта")
     
     # Используем новый API для эскалации к оператору
     success = await operator_handler.escalate_to_operator(
@@ -515,7 +825,7 @@ async def cmd_operators_list(message: Message):
     operators_list = "👨‍💼 Список операторов:\n\n"
     
     for op_id, config in operator_handler.operator_manager.operators_config.items():
-        status_emoji = "🟢" if config["is_active"] else "🔴"
+        status_emoji = "🟢" if config["is_active"] else "��"
         operators_list += (
             f"{status_emoji} {config['name']} (ID: {op_id})\n"
             f"   ⭐ {config['rating']}/5 ({config['total_sessions']} сессий)\n\n"
@@ -597,6 +907,14 @@ async def handle_operator_media(message: Message):
     else:
         logger.info(f"✅ {media_type.capitalize()} от оператора {operator_id} переслано пользователю")
 
+# Регистрируем обработчики квиза ПЕРЕД основным обработчиком текста
+if QUIZ_AVAILABLE:
+    try:
+        register_quiz_handlers(dp, bot)
+        logger.info("✅ Обработчики квиза зарегистрированы ПЕРЕД основным обработчиком")
+    except Exception as e:
+        logger.error(f"❌ Ошибка регистрации квиза: {e}")
+
 # Обработчик текстовых сообщений от пользователей
 @dp.message(F.text)
 async def handle_text(message: Message, state: FSMContext):
@@ -606,6 +924,14 @@ async def handle_text(message: Message, state: FSMContext):
     # Исключаем операторов из этого обработчика (они обрабатываются выше)
     if operator_handler.operator_manager.is_operator(user_id):
         logger.warning(f"⚠️ ВНИМАНИЕ: Сообщение оператора {user_id} попало в обработчик пользователей!")
+        return
+    
+    # Исключаем команду /quiz и состояния квиза - они обрабатываются в quiz_mod.py
+    if QUIZ_AVAILABLE and (message.text == "/quiz" or (current_state and current_state.startswith("QuizState"))):
+        if message.text == "/quiz":
+            logger.info(f"🎯 Команда /quiz от пользователя {user_id} - передаём в квиз-модуль")
+        else:
+            logger.info(f"🎯 Сообщение в состоянии квиза {current_state} - пропускаем основной обработчик")
         return
     
     logger.info(f"📝 Получено сообщение от пользователя {user_id}: '{message.text}'")
@@ -644,7 +970,7 @@ async def handle_text(message: Message, state: FSMContext):
         return
     
     # Обычная обработка сообщения с использованием RAG
-    logger.info(f"🤖 Пользователь {user_id} в обычном режиме - запускаем ИИ-обработку")
+    logger.info(f"🤖 Пользователь {user_id} (@{message.from_user.username}) спрашивает: '{message.text[:50]}{'...' if len(message.text) > 50 else ''}'")
     try:
         logger.info("🔍 Начинаем поиск в базе знаний...")
         
@@ -736,7 +1062,7 @@ async def handle_text(message: Message, state: FSMContext):
                             chat_id=sent_message.chat.id,
                             message_id=sent_message.message_id
                         )
-                    logger.info(f"✅ Стриминговый ответ завершен: {len(response_text)} символов")
+                    logger.info(f"✅ Стриминговый ответ завершен: {len(response_text)} символов для пользователя {user_id}")
                 except Exception as final_edit_error:
                     logger.error(f"Ошибка финального обновления: {final_edit_error}")
                     # Если не можем отредактировать, отправляем новое сообщение
@@ -1384,6 +1710,128 @@ async def cmd_test_lists_search(message: Message):
         logger.error(f"❌ Ошибка тестирования логики поиска: {e}")
         await message.answer("❌ Ошибка тестирования")
 
+@dp.message(Command("test_date_parser"))
+async def cmd_test_date_parser(message: Message):
+    """Команда для тестирования улучшенного парсера дат"""
+    test_dates = [
+        "13 января 2025 г. в 13:34",
+        "5 февраля 2025",
+        "март 2025",
+        "Августовская смена 2025",
+        "10 мая",
+        "25 декабря 2024 года",
+        "1 июня 2025г.",
+        "15 сентября",
+        "неправильная дата",
+        "01.02.2025",
+        "завтра",
+        "через 3 дня"
+    ]
+    
+    response_text = "🧪 **Тест улучшенного парсера дат:**\n\n"
+    response_text += "📅 Тестируем `dateparser` + fallback regex:\n\n"
+    
+    for date_str in test_dates:
+        try:
+            parsed_date = parse_russian_date(date_str)
+            if parsed_date:
+                formatted = parsed_date.strftime("%d.%m.%Y %H:%M")
+                response_text += f"✅ '{date_str}' → {formatted}\n"
+            else:
+                response_text += f"❌ '{date_str}' → не распознано\n"
+        except Exception as e:
+            response_text += f"⚠️ '{date_str}' → ошибка: {str(e)[:30]}\n"
+    
+    response_text += "\n🔧 **Возможности:**\n"
+    response_text += "• Распознавание склонений (январь/января)\n"
+    response_text += "• Поддержка 'г.' и 'года'\n"
+    response_text += "• Относительные даты (завтра, через N дней)\n"
+    response_text += "• Fallback на regex при сбое dateparser\n"
+    response_text += "• Автоматическое определение текущего года\n"
+    
+    await message.answer(response_text)
+
+@dp.message(Command("test_limits"))
+async def cmd_test_limits(message: Message):
+    """Команда для тестирования лимитов API"""
+    user_id = message.from_user.id
+    
+    response_text = "🛡️ **Статус защиты от перегрузки:**\n\n"
+    
+    # Проверяем Redis
+    if REDIS_AVAILABLE and redis is not None:
+        try:
+            # Создаем временное соединение для тестирования
+            test_redis = redis.from_url("redis://localhost", decode_responses=True)
+            key = f"user:{user_id}:quota"
+            used = await test_redis.get(key) or 0
+            ttl = await test_redis.ttl(key)
+            await test_redis.aclose()  # Правильное закрытие для redis.asyncio
+            response_text += f"🔴 **Redis:** подключен\n"
+            response_text += f"📊 **Использовано:** {used}/50 запросов\n"
+            response_text += f"⏱️ **Сброс через:** {ttl}с\n\n"
+        except Exception as e:
+            response_text += f"🔴 **Redis:** ошибка ({str(e)[:50]})\n\n"
+    else:
+        response_text += f"🔴 **Redis:** недоступен (локальный кэш)\n\n"
+    
+    # Проверяем семафор LLM
+    response_text += f"⚡ **LLM семафор:** {LLM_CONCURRENCY - llm_semaphore._value}/{LLM_CONCURRENCY} занято\n\n"
+    
+    # Проверяем middleware
+    middleware_info = "✅ активен" if any(
+        isinstance(m, HourlyLimitMiddleware) 
+        for m in dp.message.middleware.middlewares
+    ) else "❌ не найден"
+    response_text += f"🛡️ **Middleware:** {middleware_info}\n\n"
+    
+    # Статистика защиты
+    response_text += "🔧 **Настройки защиты:**\n"
+    response_text += f"• Лимит запросов: 50/час\n"
+    response_text += f"• Одновременных LLM: {LLM_CONCURRENCY}\n"
+    response_text += f"• Retry попытки: 5 (exponential backoff)\n"
+    response_text += f"• Обработка HTTP 429: автоматическая\n\n"
+    
+    response_text += "💡 **Попробуйте:**\n"
+    response_text += "• Отправить много запросов подряд\n"
+    response_text += "• Проверить автоматические ограничения\n"
+    
+    await message.answer(response_text)
+
+@dp.message(Command("rag_status"))
+async def cmd_rag_status(message: Message):
+    """Команда для проверки статуса RAG систем"""
+    response_text = "🧠 **Статус RAG систем:**\n\n"
+    
+    # Базовая RAG система
+    response_text += f"📖 **Базовая RAG:** {'✅ готова' if rag_system.knowledge_base else '❌ не готова'}\n"
+    
+    # Оптимизированная RAG система
+    if OPTIMIZED_RAG_AVAILABLE and rag_systems_ready['optimized']:
+        stats = optimized_rag.get_stats()
+        response_text += f"🚀 **Оптимизированная RAG:** ✅ готова ({stats.get('cache_hit_rate', '0%')} cache hit)\n"
+    else:
+        response_text += f"🚀 **Оптимизированная RAG:** {'🔄 загружается' if not rag_systems_ready['optimized'] else '❌ недоступна'}\n"
+    
+    # Современная RAG система
+    if MODERN_RAG_AVAILABLE and rag_systems_ready['modern']:
+        stats = modern_rag.get_stats()
+        response_text += f"📚 **Современная RAG:** ✅ готова ({stats.get('total_documents', 0)} документов)\n"
+    else:
+        response_text += f"📚 **Современная RAG:** {'🔄 загружается' if not rag_systems_ready['modern'] else '❌ недоступна'}\n"
+    
+    response_text += f"\n📊 **Готовность RAG систем:**\n"
+    response_text += f"• Базовая: {'✅' if rag_system.knowledge_base else '❌'}\n"
+    response_text += f"• Оптимизированная: {'✅' if rag_systems_ready['optimized'] else '🔄'}\n"
+    response_text += f"• Современная: {'✅' if rag_systems_ready['modern'] else '🔄'}\n"
+    
+    response_text += f"\n💡 **Приоритет использования:**\n"
+    response_text += f"1. Современная RAG (векторный поиск)\n"
+    response_text += f"2. Оптимизированная RAG (кэширование)\n"
+    response_text += f"3. Базовая RAG (ключевые слова)\n"
+    
+    await message.answer(response_text)
+
 # Обработчик для инлайн-кнопок оценки
 @dp.callback_query(F.data.startswith("rate_"))
 async def handle_rating_callback(callback: CallbackQuery):
@@ -1801,6 +2249,12 @@ async def handle_back_to_menu(callback: CallbackQuery):
             InlineKeyboardButton(text="📋 Проверить списки", callback_data="check_lists")
         ])
     
+    # Добавляем кнопку квиза, если модуль доступен
+    if QUIZ_AVAILABLE:
+        keyboard_rows.append([
+            InlineKeyboardButton(text="🎯 Квиз: подбор направления", callback_data="start_quiz")
+        ])
+    
     keyboard_rows.append([
         InlineKeyboardButton(text="👨‍💼 Связаться с консультантом", callback_data="request_consultant")
     ])
@@ -1809,6 +2263,21 @@ async def handle_back_to_menu(callback: CallbackQuery):
     
     await callback.message.edit_text(welcome_text, reply_markup=keyboard)
     await callback.answer()
+
+# Обработчик для квиза
+@dp.callback_query(F.data == "start_quiz")
+async def handle_start_quiz(callback: CallbackQuery, state: FSMContext):
+    """Запуск квиза через callback"""
+    if not QUIZ_AVAILABLE:
+        await callback.answer("❌ Квиз временно недоступен", show_alert=True)
+        return
+    
+    try:
+        await quiz_start_callback(callback, state)
+        await callback.answer()
+    except Exception as e:
+        logger.error(f"❌ Ошибка запуска квиза: {e}")
+        await callback.answer("❌ Ошибка запуска квиза", show_alert=True)
 
 # Обработчики для проверки списков
 @dp.callback_query(F.data == "check_lists")
@@ -2090,7 +2559,7 @@ async def handle_lists_search(message: Message, state: FSMContext):
 async def handle_show_calendar(callback: CallbackQuery):
     """Показать календарь смен"""
     if not CALENDAR_AVAILABLE:
-        await callback.answer("❌ Календарь временно недоступен", show_alert=True)
+        await callback.answer("❌ Календарь смен временно недоступен", show_alert=True)
         return
     
     try:
@@ -2211,27 +2680,53 @@ async def deadline_checker_loop():
 
 # Запуск бота
 async def main():
+    print("=" * 60)
+    print("🚀 ЗАПУСК БОТА НАЦИОНАЛЬНОГО ДЕТСКОГО ТЕХНОПАРКА")
+    print("=" * 60)
+    
     logger.info("🚀 Запуск бота Национального детского технопарка...")
-    logger.info("📚 Загрузка базы знаний...")
+    logger.info("📚 Загрузка базовой базы знаний...")
     
-    # Загружаем базовую RAG систему
+    # Загружаем базовую RAG систему синхронно (быстро)
     rag_system.load_knowledge_base()
+    logger.info("✅ Базовая RAG система загружена")
     
-    # Если доступна современная RAG система, показываем её статус
-    if MODERN_RAG_AVAILABLE:
-        try:
-            stats = modern_rag.get_stats()
-            logger.info(f"📚 Современная RAG система готова (ПРИОРИТЕТ): {stats['total_documents']} документов")
-        except Exception as e:
-            logger.error(f"❌ Ошибка инициализации современной RAG: {e}")
+    # Запускаем инициализацию RAG систем в фоне
+    logger.info("🔄 Запуск фоновой инициализации RAG систем...")
     
-    # Если доступна оптимизированная RAG система, показываем её статус
-    if OPTIMIZED_RAG_AVAILABLE:
-        try:
-            stats = optimized_rag.get_stats()
-            logger.info(f"🚀 Оптимизированная RAG система готова (РЕЗЕРВ): {stats}")
-        except Exception as e:
-            logger.error(f"❌ Ошибка получения статистики оптимизированной RAG: {e}")
+    # Создаем фоновые задачи для RAG систем
+    rag_tasks = []
+    
+    # Запускаем оптимизированную RAG систему
+    try:
+        rag_tasks.append(asyncio.create_task(init_optimized_rag()))
+        logger.info("🚀 Оптимизированная RAG система запущена в фоне")
+    except Exception as e:
+        logger.error(f"❌ Ошибка запуска оптимизированной RAG: {e}")
+    
+    # Запускаем современную RAG систему
+    try:
+        rag_tasks.append(asyncio.create_task(init_modern_rag()))
+        logger.info("📚 Современная RAG система запущена в фоне")
+    except Exception as e:
+        logger.error(f"❌ Ошибка запуска современной RAG: {e}")
+    
+    # Функция для мониторинга готовности RAG систем
+    async def monitor_rag_systems():
+        while True:
+            await asyncio.sleep(10)  # Проверяем каждые 10 секунд
+            ready_systems = [k for k, v in rag_systems_ready.items() if v]
+            if ready_systems:
+                logger.info(f"✅ Готовые RAG системы: {', '.join(ready_systems)}")
+            
+            # Если все системы готовы, завершаем мониторинг
+            if all(rag_systems_ready.values()):
+                logger.info("🎉 Все RAG системы готовы к работе!")
+                break
+    
+    # Запускаем мониторинг RAG систем
+    if rag_tasks:
+        asyncio.create_task(monitor_rag_systems())
     
     # Инициализируем систему уведомлений
     if NOTIFICATIONS_AVAILABLE:
@@ -2285,7 +2780,18 @@ async def main():
     else:
         logger.warning("⚠️ Парсер списков недоступен")
     
+    # Квиз модуль уже зарегистрирован ПЕРЕД основным обработчиком
+    if QUIZ_AVAILABLE:
+        logger.info("✅ Квиз модуль готов к работе")
+    else:
+        logger.warning("⚠️ Квиз модуль недоступен")
+    
+    print("=" * 60)
+    print("✅ БОТ ГОТОВ К РАБОТЕ!")
+    print("=" * 60)
+    
     logger.info("✅ Бот готов к работе!")
+    logger.info("📡 Начинаем polling обновлений от Telegram...")
     await dp.start_polling(bot)
 
 if __name__ == '__main__':

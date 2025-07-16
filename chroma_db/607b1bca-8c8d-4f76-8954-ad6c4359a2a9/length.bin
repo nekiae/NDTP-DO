@@ -1,0 +1,894 @@
+  ):
+        normed_hidden_states = self.layer_norm(hidden_states)
+        attention_output = self.SelfAttention(
+            normed_hidden_states,
+            mask=attention_mask,
+            position_bias=position_bias,
+            layer_head_mask=layer_head_mask,
+            past_key_value=past_key_value,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            cache_position=cache_position,
+        )
+        hidden_states = hidden_states + self.dropout(attention_output[0])
+        outputs = (hidden_states,) + attention_output[1:]  # add attentions if we output them
+        return outputs
+
+
+# Copied from transformers.models.t5.modeling_t5.T5LayerCrossAttention with T5->Udop
+class UdopLayerCrossAttention(nn.Module):
+    def __init__(self, config, layer_idx: Optional[int] = None):
+        super().__init__()
+        self.EncDecAttention = UdopAttention(config, has_relative_attention_bias=False, layer_idx=layer_idx)
+        self.layer_norm = UdopLayerNorm(config.d_model, eps=config.layer_norm_epsilon)
+        self.dropout = nn.Dropout(config.dropout_rate)
+
+    def forward(
+        self,
+        hidden_states,
+        key_value_states,
+        attention_mask=None,
+        position_bias=None,
+        layer_head_mask=None,
+        past_key_value=None,
+        use_cache=False,
+        query_length=None,
+        output_attentions=False,
+        cache_position=None,
+    ):
+        normed_hidden_states = self.layer_norm(hidden_states)
+        attention_output = self.EncDecAttention(
+            normed_hidden_states,
+            mask=attention_mask,
+            key_value_states=key_value_states,
+            position_bias=position_bias,
+            layer_head_mask=layer_head_mask,
+            past_key_value=past_key_value,
+            use_cache=use_cache,
+            query_length=query_length,
+            output_attentions=output_attentions,
+            cache_position=cache_position,
+        )
+        layer_output = hidden_states + self.dropout(attention_output[0])
+        outputs = (layer_output,) + attention_output[1:]  # add attentions if we output them
+        return outputs
+
+
+# Copied from transformers.models.t5.modeling_t5.T5Block with T5->Udop
+class UdopBlock(nn.Module):
+    def __init__(self, config, has_relative_attention_bias=False, layer_idx: Optional[int] = None):
+        super().__init__()
+        self.is_decoder = config.is_decoder
+        self.layer = nn.ModuleList()
+        self.layer.append(
+            UdopLayerSelfAttention(
+                config, has_relative_attention_bias=has_relative_attention_bias, layer_idx=layer_idx
+            )
+        )
+        if self.is_decoder:
+            self.layer.append(UdopLayerCrossAttention(config, layer_idx=layer_idx))
+
+        self.layer.append(UdopLayerFF(config))
+
+    def forward(
+        self,
+        hidden_states,
+        attention_mask=None,
+        position_bias=None,
+        encoder_hidden_states=None,
+        encoder_attention_mask=None,
+        encoder_decoder_position_bias=None,
+        layer_head_mask=None,
+        cross_attn_layer_head_mask=None,
+        past_key_value=None,
+        use_cache=False,
+        output_attentions=False,
+        return_dict=True,
+        cache_position=None,
+    ):
+        self_attention_outputs = self.layer[0](
+            hidden_states,
+            attention_mask=attention_mask,
+            position_bias=position_bias,
+            layer_head_mask=layer_head_mask,
+            past_key_value=past_key_value,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            cache_position=cache_position,
+        )
+        hidden_states, past_key_value = self_attention_outputs[:2]
+        attention_outputs = self_attention_outputs[2:]  # Keep self-attention outputs and relative position weights
+
+        # clamp inf values to enable fp16 training
+        if hidden_states.dtype == torch.float16:
+            clamp_value = torch.where(
+                torch.isinf(hidden_states).any(),
+                torch.finfo(hidden_states.dtype).max - 1000,
+                torch.finfo(hidden_states.dtype).max,
+            )
+            hidden_states = torch.clamp(hidden_states, min=-clamp_value, max=clamp_value)
+
+        do_cross_attention = self.is_decoder and encoder_hidden_states is not None
+        if do_cross_attention:
+            cross_attention_outputs = self.layer[1](
+                hidden_states,
+                key_value_states=encoder_hidden_states,
+                attention_mask=encoder_attention_mask,
+                position_bias=encoder_decoder_position_bias,
+                layer_head_mask=cross_attn_layer_head_mask,
+                past_key_value=past_key_value,
+                query_length=cache_position[-1] + 1,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+            )
+            hidden_states, past_key_value = cross_attention_outputs[:2]
+
+            # clamp inf values to enable fp16 training
+            if hidden_states.dtype == torch.float16:
+                clamp_value = torch.where(
+                    torch.isinf(hidden_states).any(),
+                    torch.finfo(hidden_states.dtype).max - 1000,
+                    torch.finfo(hidden_states.dtype).max,
+                )
+                hidden_states = torch.clamp(hidden_states, min=-clamp_value, max=clamp_value)
+
+            # Keep cross-attention outputs and relative position weights
+            attention_outputs = attention_outputs + cross_attention_outputs[2:]
+
+        # Apply Feed Forward layer
+        hidden_states = self.layer[-1](hidden_states)
+
+        # clamp inf values to enable fp16 training
+        if hidden_states.dtype == torch.float16:
+            clamp_value = torch.where(
+                torch.isinf(hidden_states).any(),
+                torch.finfo(hidden_states.dtype).max - 1000,
+                torch.finfo(hidden_states.dtype).max,
+            )
+            hidden_states = torch.clamp(hidden_states, min=-clamp_value, max=clamp_value)
+
+        outputs = (hidden_states,)
+
+        if use_cache:
+            outputs = outputs + (past_key_value,) + attention_outputs
+        else:
+            outputs = outputs + attention_outputs
+
+        return outputs  # hidden-states, past_key_value, (self-attention position bias), (self-attention weights), (cross-attention position bias), (cross-attention weights)
+
+
+class UdopCellEmbeddings(nn.Module):
+    def __init__(self, max_2d_position_embeddings=501, hidden_size=1024):
+        super(UdopCellEmbeddings, self).__init__()
+        self.max_2d_position_embeddings = max_2d_position_embeddings
+
+        self.x_position_embeddings = nn.Embedding(max_2d_position_embeddings, hidden_size)
+        self.y_position_embeddings = nn.Embedding(max_2d_position_embeddings, hidden_size)
+
+    def forward(self, bbox):
+        bbox = torch.clip(bbox, 0.0, 1.0)
+        bbox = (bbox * (self.max_2d_position_embeddings - 1)).long()
+        left_position_embeddings = self.x_position_embeddings(bbox[:, :, 0])
+        upper_position_embeddings = self.y_position_embeddings(bbox[:, :, 1])
+        right_position_embeddings = self.x_position_embeddings(bbox[:, :, 2])
+        lower_position_embeddings = self.y_position_embeddings(bbox[:, :, 3])
+
+        embeddings = (
+            left_position_embeddings
+            + upper_position_embeddings
+            + right_position_embeddings
+            + lower_position_embeddings
+        )
+
+        return embeddings
+
+
+# get function for bucket computation
+# protected member access seems to be lesser evil than copy paste whole function
+get_relative_position_bucket = UdopAttention._relative_position_bucket
+AUGMENTATION_RANGE = (0.80, 1.25)
+
+
+class RelativePositionBiasBase(nn.Module, ABC):
+    """
+    Base class of relative biases.
+
+    Args:
+        num_heads (`int`):
+            Number of attention heads in the model, it will create embeddings of size `num_heads`, which will be added to the scores of each token pair.
+        relative_attention_num_buckets (`int`, *optional*, defaults to 32):
+            Pair token metric (distance in the sequence, distance in pixels etc.) will be bucketed, parameter is defining number of such
+            buckets.
+        bidirectional (`bool`, *optional*, defaults to `True`):
+            Whether the distance should be bidirectional for a pair of tokens. If `False`, then distance(tok1, tok2) == distance(tok2, tok1).
+        scaling_factor (`int`, *optional*, defaults to 1):
+            Defining factor which will be used to scale relative distance.
+        max_distance (`int`, *optional*, defaults to 128):
+            All distances above this value will end up in the one/same bucket.
+        augmentation (`bool`, *optional*, defaults to `False`):
+            Whether to multiply relative distances by a random scalar.
+        expand (`bool`, *optional*, defaults to `False`):
+            Whether to expand an existing pretrained model with subsequent additions of prefix_bucket.
+    """
+
+    def __init__(
+        self,
+        num_heads=None,
+        relative_attention_num_buckets=32,
+        bidirectional=True,
+        scaling_factor=1,
+        max_distance=128,
+        level="tokens",
+        augmentation=False,
+        prefix_bucket=False,
+        expand=False,
+    ):
+        super(RelativePositionBiasBase, self).__init__()
+        self.prefix_bucket = prefix_bucket
+        self.augmentation = augmentation
+        self.level = level
+        self.max_distance = max_distance
+        self.scaling_factor = scaling_factor
+        self.bidirectional = bidirectional
+        self.num_heads = num_heads
+        self.expand = expand
+        self.relative_attention_num_buckets = relative_attention_num_buckets
+        extra_head = 2 if prefix_bucket and not self.expand else 0
+        self.relative_attention_bias = nn.Embedding(self.relative_attention_num_buckets + extra_head, self.num_heads)
+
+    @abstractmethod
+    def prepare_input(
+        self,
+        attention_mask: Optional[Tensor] = None,
+        bbox: Optional[Dict[str, Any]] = None,
+    ) -> Tensor:
+        pass
+
+    def get_bucket(self, attention_mask: Optional[Tensor] = None, bbox: Optional[Dict[str, Any]] = None) -> Tensor:
+        relative_position = self.prepare_input(attention_mask, bbox)
+        rp_bucket: Tensor = get_relative_position_bucket(
+            relative_position,
+            bidirectional=self.bidirectional,
+            num_buckets=self.relative_attention_num_buckets,
+            max_distance=self.max_distance,
+        )
+        return rp_bucket
+
+    def get_relative_position(self, positions):
+        context_position = positions[:, :, None]
+        memory_position = positions[:, None, :]
+        relative_position = memory_position - context_position
+        if self.augmentation and self.training:
+            relative_position *= random.uniform(*AUGMENTATION_RANGE)
+        relative_position *= self.scaling_factor
+
+        return relative_position.to(torch.long)
+
+    def forward(self, attention_mask: Optional[Tensor] = None, bbox: Optional[Dict[str, Any]] = None) -> Tensor:
+        # re-using pretrained model with subsequent addition of prefix_bucket
+        if self.expand and self.prefix_bucket:
+            new_bias = nn.Embedding(self.relative_attention_num_buckets + 2, self.num_heads)
+            new_bias.weight.data[: self.relative_attention_num_buckets] = self.relative_attention_bias.weight.data
+            new_bias.weight.data[self.relative_attention_num_buckets :] = 0.1
+            self.relative_attention_bias = new_bias
+            self.expand = False
+
+        rp_bucket = self.get_bucket(attention_mask, bbox)
+
+        if self.prefix_bucket:
+            if rp_bucket.size(0) == 1 and attention_mask.size(0) > 1:
+                rp_bucket = rp_bucket.repeat(attention_mask.size(0), 1, 1)
+            # based on assumption that prefix bboxes are negative
+            is_prefix = bbox[:, :, 1] < 0
+            num_prefix = is_prefix.sum(-1)
+            for idx, num_prefix_row in enumerate(num_prefix.cpu().numpy()):
+                rp_bucket[idx, :num_prefix_row, num_prefix_row:] = self.relative_attention_num_buckets
+                rp_bucket[idx, num_prefix_row:, :num_prefix_row] = self.relative_attention_num_buckets + 1
+
+        values: Tensor = self.relative_attention_bias(rp_bucket)
+        if values.dim() != 4:
+            raise ValueError("Wrong dimension of values tensor")
+        values = values.permute([0, 3, 1, 2])
+
+        return values
+
+
+class RelativePositionBias1D(RelativePositionBiasBase):
+    def __init__(self, scaling_factor=1, max_distance=128, **kwargs):
+        """
+        Reimplementation of T5 relative position bias. Distance between given tokens is their distance in the sequence.
+        Parameters are the same as in base class
+        """
+        super().__init__(scaling_factor=scaling_factor, max_distance=max_distance, **kwargs)
+
+    def prepare_input(self, attention_mask: Optional[Tensor] = None, bbox: Optional[Dict[str, Any]] = None) -> Tensor:
+        if self.scaling_factor != 1:
+            raise ValueError("No need to scale 1d features")
+        relative_position = self.get_relative_position(
+            torch.arange(attention_mask.size(1), dtype=torch.long, device=attention_mask.device)[None, :]
+        )
+
+        return relative_position
+
+
+class RelativePositionBiasHorizontal(RelativePositionBiasBase):
+    def __init__(self, scaling_factor=100, max_distance=100, **kwargs):
+        """
+        Represents in the bucket embeddings horizontal distance between two tokens. Parameters are the same as in base
+        class
+        """
+        super().__init__(scaling_factor=scaling_factor, max_distance=max_distance, **kwargs)
+
+    def prepare_input(self, attention_mask: Optional[Tensor] = None, bbox: Optional[Dict[str, Any]] = None) -> Tensor:
+        if not self.scaling_factor > 1.0:
+            raise ValueError("Need to scale the values of bboxes, as there are in small (0,1) range")
+        if bbox is None:
+            raise ValueError("Bbox is required for horizontal relative position bias")
+        # get x positions of left point of bbox
+        horizontal_position: Tensor = bbox[:, :, [0, 2]].mean(dim=-1)
+
+        return self.get_relative_position(horizontal_position)
+
+
+class RelativePositionBiasVertical(RelativePositionBiasBase):
+    def __init__(self, scaling_factor=100, max_distance=100, **kwargs):
+        """
+        Represents in the bucket embeddings vertical distance between two tokens. Parameters are the same as in base
+        class
+        """
+        super().__init__(scaling_factor=scaling_factor, max_distance=max_distance, **kwargs)
+
+    def prepare_input(self, attention_mask: Optional[Tensor] = None, bbox: Optional[Dict[str, Any]] = None) -> Tensor:
+        if not self.scaling_factor > 1.0:
+            raise ValueError("Need to scale the values of bboxes, as there are in small (0,1) range")
+        if bbox is None:
+            raise ValueError("Bbox is required for vertical relative position bias")
+        # get y positions of middle of bbox
+        vertical_position: Tensor = bbox[:, :, [1, 3]].mean(dim=-1)
+
+        return self.get_relative_position(vertical_position)
+
+
+class RelativePositionBiasAggregated(nn.Module):
+    def __init__(self, modules: Sequence[RelativePositionBiasBase]):
+        """
+        Class which sums up various computed biases.
+
+        Args:
+            modules (Sequence[RelativePositionBiasBase]):
+                List of relative bias modules.
+        """
+        super().__init__()
+        self.biases = nn.ModuleList(modules)
+
+    def forward(
+        self, attention_mask: Optional[Tensor] = None, bbox: Optional[Dict[str, Any]] = None
+    ) -> Union[float, Tensor]:
+        output = 0.0
+        for bias in self.biases:  # type: ignore
+            output = bias(attention_mask, bbox) + output
+
+        return output
+
+
+BIAS_CLASSES = {
+    "1d": RelativePositionBias1D,
+    "horizontal": RelativePositionBiasHorizontal,
+    "vertical": RelativePositionBiasVertical,
+}
+
+
+def create_relative_bias(config: UdopConfig) -> Sequence[RelativePositionBiasBase]:
+    """
+    Creates empty list or one/multiple relative biases.
+
+    :param config: Model's configuration :return: Sequence with created bias modules.
+    """
+    bias_list = []
+    if hasattr(config, "relative_bias_args"):
+        for bias_kwargs_org in config.relative_bias_args:
+            bias_kwargs = deepcopy(bias_kwargs_org)
+            bias_type = bias_kwargs.pop("type")
+            model_num_heads = config.num_heads if hasattr(config, "num_heads") else config.num_attention_heads
+            if "num_heads" in bias_kwargs:
+                if bias_kwargs["num_heads"] != model_num_heads:
+                    raise ValueError("Number of heads must match num of heads in the model")
+            else:
+                bias_kwargs["num_heads"] = model_num_heads
+            bias_list.append(BIAS_CLASSES[bias_type](**bias_kwargs))  # type: ignore
+
+    return bias_list
+
+
+class UdopStack(UdopPreTrainedModel):
+    """
+    This class is based on `T5Stack`, but modified to take into account the image modality as well as 2D position
+    embeddings.
+    """
+
+    def __init__(self, config, embed_tokens=None, embed_patches=None):
+        super().__init__(config)
+
+        self.embed_tokens = embed_tokens
+        self.embed_patches = embed_patches
+        self.is_decoder = config.is_decoder
+        self._max_length = config.max_length
+        self.num_layers = config.num_layers
+
+        self.block = nn.ModuleList(
+            [UdopBlock(config, has_relative_attention_bias=bool(i == 0), layer_idx=i) for i in range(self.num_layers)]
+        )
+        self.final_layer_norm = UdopLayerNorm(config.d_model, eps=config.layer_norm_epsilon)
+
+        self.dropout = nn.Dropout(config.dropout_rate)
+
+        if not self.is_decoder:
+            self.cell_2d_embedding = UdopCellEmbeddings(config.max_2d_position_embeddings, config.hidden_size)
+
+        # get weights from encoder position bias
+        self.relative_bias = self._get_relative_bias(config)
+
+    def _tie_weights(self):
+        for bias in self.relative_bias.biases:
+            if isinstance(bias, RelativePositionBias1D):
+                self._tie_or_clone_weights(
+                    bias.relative_attention_bias, self.block[0].layer[0].SelfAttention.relative_attention_bias
+                )
+
+    @staticmethod
+    def _get_relative_bias(config: UdopConfig) -> RelativePositionBiasAggregated:
+        relative_bias_list = create_relative_bias(config)
+        return RelativePositionBiasAggregated(relative_bias_list)
+
+    def get_input_embeddings(self):
+        return self.embed_tokens
+
+    def get_output_embeddings(self):
+        return self.embed_tokens
+
+    def set_input_embeddings(self, new_embeddings):
+        self.embed_tokens = new_embeddings
+
+    def forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        bbox=None,
+        encoder_hidden_states=None,
+        encoder_attention_mask=None,
+        inputs_embeds=None,
+        pixel_values=None,
+        visual_bbox=None,
+        image_embeddings=None,
+        position_bias=None,
+        head_mask=None,
+        cross_attn_head_mask=None,
+        past_key_values=None,
+        use_cache=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        return_dict=None,
+        cache_position=None,
+    ):
+        use_cache = use_cache if use_cache is not None else self.config.use_cache
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        # input embeddings processing
+
+        if input_ids is not None and inputs_embeds is not None:
+            err_msg_prefix = "decoder_" if self.is_decoder else ""
+            raise ValueError(
+                f"You cannot specify both {err_msg_prefix}inputs and {err_msg_prefix}inputs_embeds at the same time"
+            )
+        elif input_ids is not None and torch.numel(input_ids) > 0:
+            input_shape = input_ids.size()
+            input_ids = input_ids.view(-1, input_shape[-1])
+        elif inputs_embeds is None and input_ids is not None and torch.numel(input_ids) == 0:
+            input_ids = torch.full((4, 1024), self.config.pad_token_id, device=input_ids.device, dtype=input_ids.dtype)
+            attention_mask = torch.zeros((4, 1024), device=input_ids.device, dtype=input_ids.dtype)
+            bbox = torch.zeros((4, 1024, 4), device=input_ids.device, dtype=input_ids.dtype)
+            input_shape = input_ids.size()
+            position_bias = torch.zeros_like(self.get_extended_attention_mask(attention_mask, input_shape))
+            # encoder_attention_mask = attention_mask
+            logger.warning("Empty batch")
+        elif inputs_embeds is not None:
+            input_shape = inputs_embeds.size()[:-1]
+        else:
+            err_msg_prefix = "decoder_" if self.is_decoder else ""
+            raise ValueError(f"You have to specify either {err_msg_prefix}inputs or {err_msg_prefix}inputs_embeds")
+
+        if inputs_embeds is None:
+            if self.embed_tokens is None:
+                raise ValueError("You have to initialize the model with valid token embeddings")
+            inputs_embeds = self.embed_tokens(input_ids)
+
+        if pixel_values is not None:
+            image_embeddings = self.embed_patches(pixel_values)
+
+        if image_embeddings is not None:
+            # combine visual and OCR text embeddings
+            num_patches = self.config.image_size // self.config.patch_size
+            inputs_embeds, bbox, attention_mask = combine_image_text_embeddings(
+                image_embeddings,
+                inputs_embeds,
+                bbox,
+                visual_bbox,
+                attention_mask,
+                num_patches,
+                0,
+                self.config.image_size,
+                self.config.patch_size,
+            )
+            input_shape = inputs_embeds.size()[:-1]
+
+        if not self.is_decoder and bbox is not None:
+            inputs_embeds += self.cell_2d_embedding(bbox)
+
+        batch_size, seq_length = input_shape
+
+        if use_cache is True:
+            assert self.is_decoder, "`use_cache` can only be set to `True` if {} is used as a decoder".format(self)
+
+        # initialize past_key_values
+        return_legacy_cache = False
+        return_self_attention_cache = False
+        if self.is_decoder and (use_cache or past_key_values is not None):
+            if isinstance(past_key_values, Cache) and not isinstance(past_key_values, EncoderDecoderCache):
+                return_self_attention_cache = True
+                past_key_values = EncoderDecoderCache(past_key_values, DynamicCache())
+            elif not isinstance(past_key_values, EncoderDecoderCache):
+                return_legacy_cache = True
+                logger.warning_once(
+                    "Passing a tuple of `past_key_values` is deprecated and will be removed in Transformers v4.48.0. "
+                    "You should pass an instance of `EncoderDecoderCache` instead, e.g. "
+                    "`past_key_values=EncoderDecoderCache.from_legacy_cache(past_key_values)`."
+                )
+                past_key_values = EncoderDecoderCache.from_legacy_cache(past_key_values)
+            elif past_key_values is None:
+                past_key_values = EncoderDecoderCache(DynamicCache(), DynamicCache())
+        elif not self.is_decoder:
+            # do not pass cache object down the line for encoder stack
+            # it messes indexing later in decoder-stack because cache object is modified in-place
+            past_key_values = None
+
+        past_key_values_length = past_key_values.get_seq_length() if past_key_values is not None else 0
+        if cache_position is None:
+            cache_position = torch.arange(
+                past_key_values_length, past_key_values_length + seq_length, device=inputs_embeds.device
+            )
+
+        if attention_mask is None and not is_torchdynamo_compiling():
+            # required mask seq length can be calculated via length of past cache
+            mask_seq_length = past_key_values_length + seq_length
+            attention_mask = torch.ones(batch_size, mask_seq_length, device=inputs_embeds.device)
+
+        if self.config.is_decoder:
+            causal_mask = self._update_causal_mask(
+                attention_mask,
+                inputs_embeds,
+                cache_position,
+                past_key_values.self_attention_cache if past_key_values is not None else None,
+                output_attentions,
+            )
+        else:
+            causal_mask = attention_mask[:, None, None, :]
+            causal_mask = causal_mask.to(dtype=inputs_embeds.dtype)
+            causal_mask = (1.0 - causal_mask) * torch.finfo(inputs_embeds.dtype).min
+
+        if self.is_decoder and encoder_attention_mask is not None:
+            encoder_extended_attention_mask = self.invert_attention_mask(encoder_attention_mask)
+        else:
+            encoder_extended_attention_mask = None
+
+        # Prepare head mask if needed
+        head_mask = self.get_head_mask(head_mask, self.num_layers)
+        all_hidden_states = () if output_hidden_states else None
+        all_attentions = () if output_attentions else None
+        all_cross_attentions = () if (output_attentions and self.is_decoder) else None
+
+        if self.is_decoder:  # modified lines
+            position_bias = None
+        else:
+            position_bias = self.relative_bias(attention_mask=attention_mask, bbox=bbox)
+            position_bias = position_bias + causal_mask
+        encoder_decoder_position_bias = None
+
+        hidden_states = inputs_embeds
+
+        hidden_states = self.dropout(hidden_states)
+
+        for i, layer_module in enumerate(self.block):
+            if output_hidden_states:
+                all_hidden_states = all_hidden_states + (hidden_states,)
+
+            layer_outputs = layer_module(
+                hidden_states,
+                attention_mask=causal_mask,
+                position_bias=position_bias,
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_attention_mask=encoder_extended_attention_mask,
+                encoder_decoder_position_bias=encoder_decoder_position_bias,
+                layer_head_mask=head_mask[i],
+                past_key_value=past_key_values,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                cache_position=cache_position,
+            )
+            # layer_outputs is a tuple with:
+            # hidden-states, key-value-states, (self-attention weights), (self-attention position bias), (cross-attention weights), (cross-attention position bias)
+            if use_cache is False:  # MP fixes
+                layer_outputs = layer_outputs[:1] + (None,) + layer_outputs[1:]
+            hidden_states, next_decoder_cache = layer_outputs[:2]
+
+            # We share the position biases between the layers - the first layer store them
+            # layer_outputs = hidden-states, key-value-states (self-attention weights),
+            # (self-attention position bias), (cross-attention weights), (cross-attention position bias)
+
+            position_bias = layer_outputs[2]
+            if self.is_decoder and encoder_hidden_states is not None:
+                encoder_decoder_position_bias = layer_outputs[4 if output_attentions else 3]
+
+            if output_attentions:
+                all_attentions = all_attentions + (layer_outputs[2],)  # We keep only self-attention weights for now
+                if self.is_decoder:
+                    all_cross_attentions = all_cross_attentions + (layer_outputs[5],)
+
+        hidden_states = self.final_layer_norm(hidden_states)
+        hidden_states = self.dropout(hidden_states)
+
+        # Add last layer
+        if output_hidden_states:
+            all_hidden_states = all_hidden_states + (hidden_states,)
+
+        next_cache = next_decoder_cache if use_cache else None
+        if return_self_attention_cache:
+            next_cache = past_key_values.self_attention_cache
+        if return_legacy_cache:
+            next_cache = past_key_values.to_legacy_cache()
+
+        if not return_dict:
+            return tuple(
+                v
+                for v in [
+                    hidden_states,
+                    attention_mask,
+                    next_cache,
+                    all_hidden_states,
+                    all_attentions,
+                    all_cross_attentions,
+                ]
+                if v is not None
+            )
+
+        return BaseModelOutputWithAttentionMask(
+            last_hidden_state=hidden_states,
+            attention_mask=attention_mask,
+            past_key_values=next_cache,
+            hidden_states=all_hidden_states,
+            attentions=all_attentions,
+            cross_attentions=all_cross_attentions,
+        )
+
+    # Copied from transformers.models.llama.modeling_llama.LlamaModel._update_causal_mask
+    def _update_causal_mask(
+        self,
+        attention_mask: Union[torch.Tensor, "BlockMask"],
+        input_tensor: torch.Tensor,
+        cache_position: torch.Tensor,
+        past_key_values: Cache,
+        output_attentions: bool = False,
+    ):
+        if self.config._attn_implementation == "flash_attention_2":
+            if attention_mask is not None and (attention_mask == 0.0).any():
+                return attention_mask
+            return None
+        if self.config._attn_implementation == "flex_attention":
+            if isinstance(attention_mask, torch.Tensor):
+                attention_mask = make_flex_block_causal_mask(attention_mask)
+            return attention_mask
+
+        # For SDPA, when possible, we will rely on its `is_causal` argument instead of its `attn_mask` argument, in
+        # order to dispatch on Flash Attention 2. This feature is not compatible with static cache, as SDPA will fail
+        # to infer the attention mask.
+        past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+        using_compilable_cache = past_key_values.is_compileable if past_key_values is not None else False
+
+        # When output attentions is True, sdpa implementation's forward method calls the eager implementation's forward
+        if self.config._attn_implementation == "sdpa" and not using_compilable_cache and not output_attentions:
+            if AttentionMaskConverter._ignore_causal_mask_sdpa(
+                attention_mask,
+                inputs_embeds=input_tensor,
+                past_key_values_length=past_seen_tokens,
+                is_training=self.training,
+            ):
+                return None
+
+        dtype = input_tensor.dtype
+        sequence_length = input_tensor.shape[1]
+        if using_compilable_cache:
+            target_length = past_key_values.get_max_cache_shape()
+        else:
+            target_length = (
+                attention_mask.shape[-1]
+                if isinstance(attention_mask, torch.Tensor)
+                else past_seen_tokens + sequence_length + 1
+            )
+
+        # In case the provided `attention` mask is 2D, we generate a causal mask here (4D).
+        causal_mask = self._prepare_4d_causal_attention_mask_with_cache_position(
+            attention_mask,
+            sequence_length=sequence_length,
+            target_length=target_length,
+            dtype=dtype,
+            cache_position=cache_position,
+            batch_size=input_tensor.shape[0],
+        )
+
+        if (
+            self.config._attn_implementation == "sdpa"
+            and attention_mask is not None
+            and attention_mask.device.type in ["cuda", "xpu", "npu"]
+            and not output_attentions
+        ):
+            # Attend to all tokens in fully masked rows in the causal_mask, for example the relevant first rows when
+            # using left padding. This is required by F.scaled_dot_product_attention memory-efficient attention path.
+            # Details: https://github.com/pytorch/pytorch/issues/110213
+            min_dtype = torch.finfo(dtype).min
+            causal_mask = AttentionMaskConverter._unmask_unattended(causal_mask, min_dtype)
+
+        return causal_mask
+
+    @staticmethod
+    # Copied from transformers.models.llama.modeling_llama.LlamaPreTrainedModel._prepare_4d_causal_attention_mask_with_cache_position
+    def _prepare_4d_causal_attention_mask_with_cache_position(
+        attention_mask: torch.Tensor,
+        sequence_length: int,
+        target_length: int,
+        dtype: torch.dtype,
+        cache_position: torch.Tensor,
+        batch_size: int,
+        **kwargs,
+    ):
+        """
+        Creates a causal 4D mask of shape `(batch_size, 1, query_length, key_value_length)` from a 2D mask of shape
+        `(batch_size, key_value_length)`, or if the input `attention_mask` is already 4D, do nothing.
+
+        Args:
+            attention_mask (`torch.Tensor`):
+                A 2D attention mask of shape `(batch_size, key_value_length)` or a 4D attention mask of shape
+                `(batch_size, 1, query_length, key_value_length)`.
+            sequence_length (`int`):
+                The sequence length being processed.
+            target_length (`int`):
+                The target length: when generating with static cache, the mask should be as long as the static cache,
+                to account for the 0 padding, the part of the cache that is not filled yet.
+            dtype (`torch.dtype`):
+                The dtype to use for the 4D attention mask.
+            cache_position (`torch.Tensor`):
+                Indices depicting the position of the input sequence tokens in the sequence.
+            batch_size (`torch.Tensor`):
+                Batch size.
+        """
+        if attention_mask is not None and attention_mask.dim() == 4:
+            # In this case we assume that the mask comes already in inverted form and requires no inversion or slicing.
+            causal_mask = attention_mask
+        else:
+            min_dtype = torch.finfo(dtype).min
+            causal_mask = torch.full(
+                (sequence_length, target_length), fill_value=min_dtype, dtype=dtype, device=cache_position.device
+            )
+            if sequence_length != 1:
+                causal_mask = torch.triu(causal_mask, diagonal=1)
+            causal_mask *= torch.arange(target_length, device=cache_position.device) > cache_position.reshape(-1, 1)
+            causal_mask = causal_mask[None, None, :, :].expand(batch_size, 1, -1, -1)
+            if attention_mask is not None:
+                causal_mask = causal_mask.clone()  # copy to contiguous memory for in-place edit
+                mask_length = attention_mask.shape[-1]
+                padding_mask = causal_mask[:, :, :, :mask_length] + attention_mask[:, None, None, :].to(
+                    causal_mask.device
+                )
+                padding_mask = padding_mask == 0
+                causal_mask[:, :, :, :mask_length] = causal_mask[:, :, :, :mask_length].masked_fill(
+                    padding_mask, min_dtype
+                )
+
+        return causal_mask
+
+
+@auto_docstring
+class UdopModel(UdopPreTrainedModel):
+    _tied_weights_keys = [
+        "encoder.embed_tokens.weight",
+        "decoder.embed_tokens.weight",
+        "encoder.embed_patches.proj.weight",
+        "encoder.embed_patches.proj.bias",
+        "encoder.relative_bias.biases.0.relative_attention_bias.weight",
+        "decoder.relative_bias.biases.0.relative_attention_bias.weight",
+    ]
+
+    def __init__(self, config):
+        super(UdopModel, self).__init__(config)
+
+        # text and image embeddings
+        self.shared = nn.Embedding(config.vocab_size, config.d_model)
+        self.patch_embed = UdopPatchEmbeddings(config)
+
+        encoder_config = deepcopy(config)
+        encoder_config.is_decoder = False
+        encoder_config.use_cache = False
+        encoder_config.is_encoder_decoder = False
+        self.encoder = UdopStack(encoder_config, self.shared, self.patch_embed)
+
+        decoder_config = deepcopy(config)
+        decoder_config.is_decoder = True
+        decoder_config.is_encoder_decoder = False
+        decoder_config.num_layers = config.num_decoder_layers
+        self.decoder = UdopStack(decoder_config, self.shared)
+
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    def get_input_embeddings(self):
+        return self.shared
+
+    def set_input_embeddings(self, new_embeddings):
+        self.shared = new_embeddings
+        self.encoder.set_input_embeddings(new_embeddings)
+        self.decoder.set_input_embeddings(new_embeddings)
+
+    def get_encoder(self):
+        return self.encoder
+
+    def get_decoder(self):
+        return self.decoder
+
+    @auto_docstring
+    def forward(
+        self,
+        input_ids: Optional[Tensor] = None,
+        attention_mask: Optional[Tensor] = None,
+        bbox: Optional[Dict[str, Any]] = None,
+        pixel_values: Optional[Tensor] = None,
+        visual_bbox: Optional[Dict[str, Any]] = None,
+        decoder_input_ids: Optional[Tensor] = None,
+        decoder_attention_mask: Optional[Tensor] = None,
+        inputs_embeds: Optional[Tensor] = None,
+        encoder_outputs: Optional[Tensor] = None,
+        past_key_values: Optional[Tensor] = None,
+        head_mask: Optional[Tensor] = None,
+        decoder_inputs_embeds: Optional[Tensor] = None,
+        decoder_head_mask: Optional[Tensor] = None,
+        cross_attn_head_mask: Optional[Tensor] = None,
+        use_cache=True,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+    ) -> Tuple[Tensor, ...]:
+        r"""
+        bbox (`torch.LongTensor` of shape `({0}, 4)`, *optional*):
+            Bounding boxes of each input sequence tokens. Selected in the range `[0,
+            config.max_2d_position_embeddings-1]`. Each bounding box should be a normalized version in (x0, y0, x1, y1)
+            format, where (x0, y0) corresponds to the position of the upper left corner in the bounding box, and (x1,
+            y1) represents the position of the lower right corner.
+
+            Note that `sequence_length = token_sequence_length + patch_sequence_length + 1` where `1` is for [CLS]
+            token. See `pixel_values` for `patch_sequence_length`.
+        visual_bbox (`torch.LongTensor` of shape `(batch_size, patch_sequence_length, 4)`, *optional*):
+            Bounding boxes of each patch in the image. If not provided, bounding boxes are created in the model.
+        decoder_input_ids (`torch.LongTensor` of shape `(batch_size, target_sequence_length)`, *optional*):
+            Indices of decoder input sequence tokens in the vocabulary. Indices can be obtained using
+            [`AutoTokenizer`]. See [`PreTrainedTokenizer.encode`] and [`PreTrainedTokenizer.__call__`] for details.
+            [What are decoder input IDs?](../glossary#decoder-input-ids) T5 uses the `pad_token_id` as the starting
+            token for `decoder_input_ids` generation. If `past_key_values` is used, optionally only the last
+            `decoder_input_ids` have to be input (see `past_key_values`). To know more on how to prepare
+            `decoder_input_ids` for pretraining take a look at [T5 Training](./t5#training).
+        decoder_attention_mask (`torch.BoolTensor` of shape `(batch_size, target_sequence_length)`, *optional*):
+            Default behavior: generate a tensor that ignores pad tokens in `decoder_input_ids`. Causal mask will also
+            be used by default.
+        decoder_head_mask (`torch.FloatTensor` of shape `(num_heads,)` or `(num_layers, num_heads)`, *optional*):
+       

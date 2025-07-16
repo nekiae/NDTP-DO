@@ -1,0 +1,924 @@
+ter-roberta-base-emotion",
+        output_type=TFSequenceClassifierOutput,
+        config_class=_CONFIG_FOR_DOC,
+        expected_output="'optimism'",
+        expected_loss=0.08,
+    )
+    def call(
+        self,
+        input_ids: TFModelInputType | None = None,
+        attention_mask: np.ndarray | tf.Tensor | None = None,
+        token_type_ids: np.ndarray | tf.Tensor | None = None,
+        position_ids: np.ndarray | tf.Tensor | None = None,
+        head_mask: np.ndarray | tf.Tensor | None = None,
+        inputs_embeds: np.ndarray | tf.Tensor | None = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        labels: np.ndarray | tf.Tensor | None = None,
+        training: Optional[bool] = False,
+    ) -> Union[TFSequenceClassifierOutput, Tuple[tf.Tensor]]:
+        r"""
+        labels (`tf.Tensor` of shape `(batch_size,)`, *optional*):
+            Labels for computing the sequence classification/regression loss. Indices should be in `[0, ...,
+            config.num_labels - 1]`. If `config.num_labels == 1` a regression loss is computed (Mean-Square loss), If
+            `config.num_labels > 1` a classification loss is computed (Cross-Entropy).
+        """
+        outputs = self.roberta(
+            input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            head_mask=head_mask,
+            inputs_embeds=inputs_embeds,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            training=training,
+        )
+        sequence_output = outputs[0]
+        logits = self.classifier(sequence_output, training=training)
+
+        loss = None if labels is None else self.hf_compute_loss(labels, logits)
+
+        if not return_dict:
+            output = (logits,) + outputs[2:]
+            return ((loss,) + output) if loss is not None else output
+
+        return TFSequenceClassifierOutput(
+            loss=loss,
+            logits=logits,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
+    def build(self, input_shape=None):
+        if self.built:
+            return
+        self.built = True
+        if getattr(self, "roberta", None) is not None:
+            with tf.name_scope(self.roberta.name):
+                self.roberta.build(None)
+        if getattr(self, "classifier", None) is not None:
+            with tf.name_scope(self.classifier.name):
+                self.classifier.build(None)
+
+
+@add_start_docstrings(
+    """
+    XLM Roberta Model with a multiple choice classification head on top (a linear layer on top of the pooled output and
+    a softmax) e.g. for RocStories/SWAG tasks.
+    """,
+    XLM_ROBERTA_START_DOCSTRING,
+)
+# Copied from transformers.models.roberta.modeling_tf_roberta.TFRobertaForMultipleChoice with Roberta->XLMRoberta, ROBERTA->XLM_ROBERTA
+class TFXLMRobertaForMultipleChoice(TFXLMRobertaPreTrainedModel, TFMultipleChoiceLoss):
+    # names with a '.' represents the authorized unexpected/missing layers when a TF model is loaded from a PT model
+    _keys_to_ignore_on_load_unexpected = [r"lm_head"]
+    _keys_to_ignore_on_load_missing = [r"dropout"]
+
+    def __init__(self, config, *inputs, **kwargs):
+        super().__init__(config, *inputs, **kwargs)
+
+        self.roberta = TFXLMRobertaMainLayer(config, name="roberta")
+        self.dropout = keras.layers.Dropout(config.hidden_dropout_prob)
+        self.classifier = keras.layers.Dense(
+            1, kernel_initializer=get_initializer(config.initializer_range), name="classifier"
+        )
+        self.config = config
+
+    @unpack_inputs
+    @add_start_docstrings_to_model_forward(
+        XLM_ROBERTA_INPUTS_DOCSTRING.format("batch_size, num_choices, sequence_length")
+    )
+    @add_code_sample_docstrings(
+        checkpoint=_CHECKPOINT_FOR_DOC,
+        output_type=TFMultipleChoiceModelOutput,
+        config_class=_CONFIG_FOR_DOC,
+    )
+    def call(
+        self,
+        input_ids: TFModelInputType | None = None,
+        attention_mask: np.ndarray | tf.Tensor | None = None,
+        token_type_ids: np.ndarray | tf.Tensor | None = None,
+        position_ids: np.ndarray | tf.Tensor | None = None,
+        head_mask: np.ndarray | tf.Tensor | None = None,
+        inputs_embeds: np.ndarray | tf.Tensor | None = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        labels: np.ndarray | tf.Tensor | None = None,
+        training: Optional[bool] = False,
+    ) -> Union[TFMultipleChoiceModelOutput, Tuple[tf.Tensor]]:
+        r"""
+        labels (`tf.Tensor` of shape `(batch_size,)`, *optional*):
+            Labels for computing the multiple choice classification loss. Indices should be in `[0, ..., num_choices]`
+            where `num_choices` is the size of the second dimension of the input tensors. (See `input_ids` above)
+        """
+
+        if input_ids is not None:
+            num_choices = shape_list(input_ids)[1]
+            seq_length = shape_list(input_ids)[2]
+        else:
+            num_choices = shape_list(inputs_embeds)[1]
+            seq_length = shape_list(inputs_embeds)[2]
+
+        flat_input_ids = tf.reshape(input_ids, (-1, seq_length)) if input_ids is not None else None
+        flat_attention_mask = tf.reshape(attention_mask, (-1, seq_length)) if attention_mask is not None else None
+        flat_token_type_ids = tf.reshape(token_type_ids, (-1, seq_length)) if token_type_ids is not None else None
+        flat_position_ids = tf.reshape(position_ids, (-1, seq_length)) if position_ids is not None else None
+        outputs = self.roberta(
+            flat_input_ids,
+            flat_attention_mask,
+            flat_token_type_ids,
+            flat_position_ids,
+            head_mask,
+            inputs_embeds,
+            output_attentions,
+            output_hidden_states,
+            return_dict=return_dict,
+            training=training,
+        )
+        pooled_output = outputs[1]
+        pooled_output = self.dropout(pooled_output, training=training)
+        logits = self.classifier(pooled_output)
+        reshaped_logits = tf.reshape(logits, (-1, num_choices))
+
+        loss = None if labels is None else self.hf_compute_loss(labels, reshaped_logits)
+
+        if not return_dict:
+            output = (reshaped_logits,) + outputs[2:]
+            return ((loss,) + output) if loss is not None else output
+
+        return TFMultipleChoiceModelOutput(
+            loss=loss,
+            logits=reshaped_logits,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
+    def build(self, input_shape=None):
+        if self.built:
+            return
+        self.built = True
+        if getattr(self, "roberta", None) is not None:
+            with tf.name_scope(self.roberta.name):
+                self.roberta.build(None)
+        if getattr(self, "classifier", None) is not None:
+            with tf.name_scope(self.classifier.name):
+                self.classifier.build([None, None, self.config.hidden_size])
+
+
+@add_start_docstrings(
+    """
+    XLM RoBERTa Model with a token classification head on top (a linear layer on top of the hidden-states output) e.g.
+    for Named-Entity-Recognition (NER) tasks.
+    """,
+    XLM_ROBERTA_START_DOCSTRING,
+)
+# Copied from transformers.models.roberta.modeling_tf_roberta.TFRobertaForTokenClassification with Roberta->XLMRoberta, ROBERTA->XLM_ROBERTA
+class TFXLMRobertaForTokenClassification(TFXLMRobertaPreTrainedModel, TFTokenClassificationLoss):
+    # names with a '.' represents the authorized unexpected/missing layers when a TF model is loaded from a PT model
+    _keys_to_ignore_on_load_unexpected = [r"pooler", r"lm_head"]
+    _keys_to_ignore_on_load_missing = [r"dropout"]
+
+    def __init__(self, config, *inputs, **kwargs):
+        super().__init__(config, *inputs, **kwargs)
+        self.num_labels = config.num_labels
+
+        self.roberta = TFXLMRobertaMainLayer(config, add_pooling_layer=False, name="roberta")
+        classifier_dropout = (
+            config.classifier_dropout if config.classifier_dropout is not None else config.hidden_dropout_prob
+        )
+        self.dropout = keras.layers.Dropout(classifier_dropout)
+        self.classifier = keras.layers.Dense(
+            config.num_labels, kernel_initializer=get_initializer(config.initializer_range), name="classifier"
+        )
+        self.config = config
+
+    @unpack_inputs
+    @add_start_docstrings_to_model_forward(XLM_ROBERTA_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
+    @add_code_sample_docstrings(
+        checkpoint="ydshieh/roberta-large-ner-english",
+        output_type=TFTokenClassifierOutput,
+        config_class=_CONFIG_FOR_DOC,
+        expected_output="['O', 'ORG', 'ORG', 'O', 'O', 'O', 'O', 'O', 'LOC', 'O', 'LOC', 'LOC']",
+        expected_loss=0.01,
+    )
+    def call(
+        self,
+        input_ids: TFModelInputType | None = None,
+        attention_mask: np.ndarray | tf.Tensor | None = None,
+        token_type_ids: np.ndarray | tf.Tensor | None = None,
+        position_ids: np.ndarray | tf.Tensor | None = None,
+        head_mask: np.ndarray | tf.Tensor | None = None,
+        inputs_embeds: np.ndarray | tf.Tensor | None = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        labels: np.ndarray | tf.Tensor | None = None,
+        training: Optional[bool] = False,
+    ) -> Union[TFTokenClassifierOutput, Tuple[tf.Tensor]]:
+        r"""
+        labels (`tf.Tensor` of shape `(batch_size, sequence_length)`, *optional*):
+            Labels for computing the token classification loss. Indices should be in `[0, ..., config.num_labels - 1]`.
+        """
+        outputs = self.roberta(
+            input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            head_mask=head_mask,
+            inputs_embeds=inputs_embeds,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            training=training,
+        )
+        sequence_output = outputs[0]
+
+        sequence_output = self.dropout(sequence_output, training=training)
+        logits = self.classifier(sequence_output)
+
+        loss = None if labels is None else self.hf_compute_loss(labels, logits)
+
+        if not return_dict:
+            output = (logits,) + outputs[2:]
+            return ((loss,) + output) if loss is not None else output
+
+        return TFTokenClassifierOutput(
+            loss=loss,
+            logits=logits,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
+    def build(self, input_shape=None):
+        if self.built:
+            return
+        self.built = True
+        if getattr(self, "roberta", None) is not None:
+            with tf.name_scope(self.roberta.name):
+                self.roberta.build(None)
+        if getattr(self, "classifier", None) is not None:
+            with tf.name_scope(self.classifier.name):
+                self.classifier.build([None, None, self.config.hidden_size])
+
+
+@add_start_docstrings(
+    """
+    XLM RoBERTa Model with a span classification head on top for extractive question-answering tasks like SQuAD (a
+    linear layers on top of the hidden-states output to compute `span start logits` and `span end logits`).
+    """,
+    XLM_ROBERTA_START_DOCSTRING,
+)
+# Copied from transformers.models.roberta.modeling_tf_roberta.TFRobertaForQuestionAnswering with Roberta->XLMRoberta, ROBERTA->XLM_ROBERTA
+class TFXLMRobertaForQuestionAnswering(TFXLMRobertaPreTrainedModel, TFQuestionAnsweringLoss):
+    # names with a '.' represents the authorized unexpected/missing layers when a TF model is loaded from a PT model
+    _keys_to_ignore_on_load_unexpected = [r"pooler", r"lm_head"]
+
+    def __init__(self, config, *inputs, **kwargs):
+        super().__init__(config, *inputs, **kwargs)
+        self.num_labels = config.num_labels
+
+        self.roberta = TFXLMRobertaMainLayer(config, add_pooling_layer=False, name="roberta")
+        self.qa_outputs = keras.layers.Dense(
+            config.num_labels, kernel_initializer=get_initializer(config.initializer_range), name="qa_outputs"
+        )
+        self.config = config
+
+    @unpack_inputs
+    @add_start_docstrings_to_model_forward(XLM_ROBERTA_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
+    @add_code_sample_docstrings(
+        checkpoint="ydshieh/roberta-base-squad2",
+        output_type=TFQuestionAnsweringModelOutput,
+        config_class=_CONFIG_FOR_DOC,
+        expected_output="' puppet'",
+        expected_loss=0.86,
+    )
+    def call(
+        self,
+        input_ids: TFModelInputType | None = None,
+        attention_mask: np.ndarray | tf.Tensor | None = None,
+        token_type_ids: np.ndarray | tf.Tensor | None = None,
+        position_ids: np.ndarray | tf.Tensor | None = None,
+        head_mask: np.ndarray | tf.Tensor | None = None,
+        inputs_embeds: np.ndarray | tf.Tensor | None = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        start_positions: np.ndarray | tf.Tensor | None = None,
+        end_positions: np.ndarray | tf.Tensor | None = None,
+        training: Optional[bool] = False,
+    ) -> Union[TFQuestionAnsweringModelOutput, Tuple[tf.Tensor]]:
+        r"""
+        start_positions (`tf.Tensor` of shape `(batch_size,)`, *optional*):
+            Labels for position (index) of the start of the labelled span for computing the token classification loss.
+            Positions are clamped to the length of the sequence (`sequence_length`). Position outside of the sequence
+            are not taken into account for computing the loss.
+        end_positions (`tf.Tensor` of shape `(batch_size,)`, *optional*):
+            Labels for position (index) of the end of the labelled span for computing the token classification loss.
+            Positions are clamped to the length of the sequence (`sequence_length`). Position outside of the sequence
+            are not taken into account for computing the loss.
+        """
+        outputs = self.roberta(
+            input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            head_mask=head_mask,
+            inputs_embeds=inputs_embeds,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            training=training,
+        )
+        sequence_output = outputs[0]
+
+        logits = self.qa_outputs(sequence_output)
+        start_logits, end_logits = tf.split(logits, 2, axis=-1)
+        start_logits = tf.squeeze(start_logits, axis=-1)
+        end_logits = tf.squeeze(end_logits, axis=-1)
+
+        loss = None
+        if start_positions is not None and end_positions is not None:
+            labels = {"start_position": start_positions}
+            labels["end_position"] = end_positions
+            loss = self.hf_compute_loss(labels, (start_logits, end_logits))
+
+        if not return_dict:
+            output = (start_logits, end_logits) + outputs[2:]
+            return ((loss,) + output) if loss is not None else output
+
+        return TFQuestionAnsweringModelOutput(
+            loss=loss,
+            start_logits=start_logits,
+            end_logits=end_logits,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
+    def build(self, input_shape=None):
+        if self.built:
+            return
+        self.built = True
+        if getattr(self, "roberta", None) is not None:
+            with tf.name_scope(self.roberta.name):
+                self.roberta.build(None)
+        if getattr(self, "qa_outputs", None) is not None:
+            with tf.name_scope(self.qa_outputs.name):
+                self.qa_outputs.build([None, None, self.config.hidden_size])
+
+
+__all__ = [
+    "TFXLMRobertaForCausalLM",
+    "TFXLMRobertaForMaskedLM",
+    "TFXLMRobertaForMultipleChoice",
+    "TFXLMRobertaForQuestionAnswering",
+    "TFXLMRobertaForSequenceClassification",
+    "TFXLMRobertaForTokenClassification",
+    "TFXLMRobertaModel",
+    "TFXLMRobertaPreTrainedModel",
+]
+ head_mask[idx] if head_mask is not None else None),
+                    cross_attn_layer_head_mask=(
+                        cross_attn_head_mask[idx] if cross_attn_head_mask is not None else None
+                    ),
+                    extended_predict_attention_mask=extended_predict_attention_mask,
+                    main_relative_position_buckets=main_relative_position_buckets,
+                    predict_relative_position_buckets=predict_relative_position_buckets,
+                    position_ids=position_ids,
+                    past_key_value=past_key_value,
+                    use_cache=use_cache,
+                    output_attentions=output_attentions,
+                )
+
+            hidden_states = layer_outputs[0]
+
+            if use_cache:
+                present_key_values += (layer_outputs[4 if output_attentions else 1],)
+
+            if output_attentions:
+                all_main_stream_attns += (layer_outputs[1],)
+                all_ngram_stream_attns += (layer_outputs[2],)
+
+                if self.config.add_cross_attention:
+                    all_cross_attns += (layer_outputs[3],)
+
+        if output_hidden_states:
+            all_main_stream_hidden_states += (hidden_states[:, :sequence_length],)
+            if self.config.ngram > 0:
+                all_ngram_stream_hidden_states += (hidden_states[:, sequence_length:],)
+
+        # split last_hidden_state for return
+        last_hidden_state = hidden_states[:, :sequence_length]
+        last_hidden_state_ngram = hidden_states[:, sequence_length:] if self.config.ngram > 0 else None
+
+        if not return_dict:
+            return tuple(
+                v
+                for v in [
+                    last_hidden_state,
+                    last_hidden_state_ngram,
+                    present_key_values,
+                    all_main_stream_hidden_states,
+                    all_ngram_stream_hidden_states,
+                    all_main_stream_attns,
+                    all_ngram_stream_attns,
+                    all_cross_attns,
+                ]
+                if v is not None
+            )
+        return XLMProphetNetDecoderModelOutput(
+            last_hidden_state=last_hidden_state,
+            last_hidden_state_ngram=last_hidden_state_ngram,
+            past_key_values=present_key_values,
+            hidden_states=all_main_stream_hidden_states,
+            hidden_states_ngram=all_ngram_stream_hidden_states,
+            attentions=all_main_stream_attns,
+            ngram_attentions=all_ngram_stream_attns,
+            cross_attentions=all_cross_attns,
+        )
+
+    def compute_buffered_relative_buckets(self, position_ids):
+        batch_size, sequence_length = position_ids.shape
+
+        position_ids = torch.arange(1, self.max_target_positions).to(position_ids.device).repeat(1, 1)
+        main_relative_buckets, predict_relative_buckets = compute_all_stream_relative_buckets(
+            self.num_buckets, self.relative_max_distance, position_ids
+        )
+
+        # buffer relative buckets
+        main_relative_buckets = main_relative_buckets[:, :sequence_length, :sequence_length].repeat(batch_size, 1, 1)
+        predict_relative_buckets = torch.cat(
+            [
+                predict_relative_buckets[:, :sequence_length, :sequence_length],
+                predict_relative_buckets[
+                    :, :sequence_length, self.max_target_positions : self.max_target_positions + sequence_length
+                ],
+            ],
+            2,
+        ).repeat(batch_size, 1, 1)
+
+        return main_relative_buckets, predict_relative_buckets
+
+    def prepare_attention_mask(self, hidden_states, attention_mask):
+        batch_size, seq_length = hidden_states.shape[:2]
+
+        # get causal mask
+        causal_mask = torch.full(
+            (seq_length, seq_length),
+            torch.finfo(hidden_states.dtype).min,
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        causal_mask = torch.triu(causal_mask, 1)
+
+        extended_causal_mask = causal_mask[:seq_length, :seq_length][None, None, :, :].expand(
+            (batch_size, self.config.num_decoder_attention_heads) + causal_mask.shape
+        )
+
+        # add usual attention mask
+        if attention_mask is not None:
+            extended_attention_mask = (1.0 - attention_mask[:, None, None, :]) * torch.finfo(self.dtype).min
+            extended_attention_mask = extended_causal_mask + extended_attention_mask
+        else:
+            extended_attention_mask = extended_causal_mask
+        return extended_attention_mask.to(hidden_states.dtype)
+
+    def prepare_predict_attention_mask(self, hidden_states, attention_mask):
+        batch_size, seq_length = hidden_states.shape[:2]
+
+        # get causal mask
+        predict_causal_mask = ngram_attention_bias(
+            self.max_target_positions, self.ngram, hidden_states.device, hidden_states.dtype
+        )
+        predict_causal_mask = torch.cat(
+            [
+                predict_causal_mask[:, :seq_length, :seq_length],
+                predict_causal_mask[
+                    :, :seq_length, self.max_target_positions : self.max_target_positions + seq_length
+                ],
+            ],
+            dim=-1,
+        )
+        extended_predict_causal_mask = predict_causal_mask[None, None, :, :, :].expand(
+            (batch_size, self.config.num_decoder_attention_heads) + predict_causal_mask.shape
+        )
+
+        # add usual attention mask
+        if attention_mask is not None:
+            extended_attention_mask = (1.0 - attention_mask[:, None, None, None, :]) * torch.finfo(self.dtype).min
+            extended_attention_mask = extended_attention_mask.expand(
+                (batch_size, self.config.num_decoder_attention_heads, self.ngram, seq_length, seq_length)
+            )
+            # predicted stream attention_mask should always be 0
+            extended_attention_mask = torch.cat(
+                [extended_attention_mask, torch.zeros_like(extended_attention_mask)], dim=-1
+            )
+            extended_predict_attention_mask = extended_predict_causal_mask + extended_attention_mask
+        else:
+            extended_predict_attention_mask = extended_predict_causal_mask
+        return extended_predict_attention_mask.to(hidden_states.dtype)
+
+
+@add_start_docstrings(
+    "The bare XLMProphetNet Model outputting raw hidden-states without any specific head on top.",
+    XLM_PROPHETNET_START_DOCSTRING,
+)
+class XLMProphetNetModel(XLMProphetNetPreTrainedModel):
+    _tied_weights_keys = ["encoder.word_embeddings.weight", "decoder.word_embeddings.weight"]
+
+    def __init__(self, config: XLMProphetNetConfig):
+        super().__init__(config)
+        self.word_embeddings = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id)
+
+        encoder_config = copy.deepcopy(config)
+        encoder_config.is_encoder_decoder = False
+        encoder_config.use_cache = False
+        self.encoder = XLMProphetNetEncoder(encoder_config, self.word_embeddings)
+
+        decoder_config = copy.deepcopy(config)
+        decoder_config.is_decoder = True
+        decoder_config.is_encoder_decoder = False
+        self.decoder = XLMProphetNetDecoder(decoder_config, self.word_embeddings)
+
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    def get_input_embeddings(self):
+        return self.word_embeddings
+
+    def set_input_embeddings(self, value):
+        self.word_embeddings = value
+        self.encoder.word_embeddings = self.word_embeddings
+        self.decoder.word_embeddings = self.word_embeddings
+
+    def _tie_weights(self):
+        if self.config.tie_word_embeddings:
+            self._tie_or_clone_weights(self.encoder.word_embeddings, self.word_embeddings)
+            self._tie_or_clone_weights(self.decoder.word_embeddings, self.word_embeddings)
+
+    def get_encoder(self):
+        return self.encoder
+
+    def get_decoder(self):
+        return self.decoder
+
+    @add_start_docstrings_to_model_forward(XLM_PROPHETNET_INPUTS_DOCSTRING)
+    @replace_return_docstrings(output_type=XLMProphetNetSeq2SeqModelOutput, config_class=_CONFIG_FOR_DOC)
+    def forward(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        decoder_input_ids: Optional[torch.Tensor] = None,
+        decoder_attention_mask: Optional[torch.BoolTensor] = None,
+        head_mask: Optional[torch.Tensor] = None,
+        decoder_head_mask: Optional[torch.Tensor] = None,
+        cross_attn_head_mask: Optional[torch.Tensor] = None,
+        encoder_outputs: Optional[Tuple] = None,
+        past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        decoder_inputs_embeds: Optional[torch.Tensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+    ) -> Union[Tuple, XLMProphetNetSeq2SeqModelOutput]:
+        r"""
+        Returns:
+
+        Example:
+
+        ```python
+        >>> from transformers import AutoTokenizer, XLMProphetNetModel
+
+        >>> tokenizer = AutoTokenizer.from_pretrained("patrickvonplaten/xprophetnet-large-uncased-standalone")
+        >>> model = XLMProphetNetModel.from_pretrained("patrickvonplaten/xprophetnet-large-uncased-standalone")
+
+        >>> input_ids = tokenizer(
+        ...     "Studies have been shown that owning a dog is good for you", return_tensors="pt"
+        ... ).input_ids  # Batch size 1
+        >>> decoder_input_ids = tokenizer("Studies show that", return_tensors="pt").input_ids  # Batch size 1
+        >>> outputs = model(input_ids=input_ids, decoder_input_ids=decoder_input_ids)
+
+        >>> last_hidden_states = outputs.last_hidden_state  # main stream hidden states
+        >>> last_hidden_states_ngram = outputs.last_hidden_state_ngram  # predict hidden states
+        ```"""
+        use_cache = use_cache if use_cache is not None else self.config.use_cache
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        if encoder_outputs is None:
+            encoder_outputs = self.encoder(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                head_mask=head_mask,
+                inputs_embeds=inputs_embeds,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+            )
+
+        # decoder outputs consists of (dec_features, past_key_values, dec_hidden, dec_attn)
+        decoder_outputs = self.decoder(
+            input_ids=decoder_input_ids,
+            attention_mask=decoder_attention_mask,
+            encoder_hidden_states=encoder_outputs[0],
+            encoder_attention_mask=attention_mask,
+            head_mask=decoder_head_mask,
+            cross_attn_head_mask=cross_attn_head_mask,
+            past_key_values=past_key_values,
+            inputs_embeds=decoder_inputs_embeds,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            use_cache=use_cache,
+            return_dict=return_dict,
+        )
+
+        if not return_dict:
+            return decoder_outputs + encoder_outputs
+        return XLMProphetNetSeq2SeqModelOutput(
+            last_hidden_state=decoder_outputs.last_hidden_state,
+            last_hidden_state_ngram=decoder_outputs.last_hidden_state_ngram,
+            past_key_values=decoder_outputs.past_key_values,
+            decoder_hidden_states=decoder_outputs.hidden_states,
+            decoder_ngram_hidden_states=decoder_outputs.hidden_states_ngram,
+            decoder_attentions=decoder_outputs.attentions,
+            decoder_ngram_attentions=decoder_outputs.ngram_attentions,
+            cross_attentions=decoder_outputs.cross_attentions,
+            encoder_last_hidden_state=encoder_outputs.last_hidden_state,
+            encoder_hidden_states=encoder_outputs.hidden_states,
+            encoder_attentions=encoder_outputs.attentions,
+        )
+
+
+@add_start_docstrings(
+    "The XLMProphetNet Model with a language modeling head. Can be used for sequence generation tasks.",
+    XLM_PROPHETNET_START_DOCSTRING,
+)
+class XLMProphetNetForConditionalGeneration(XLMProphetNetPreTrainedModel):
+    _tied_weights_keys = ["encoder.word_embeddings.weight", "decoder.word_embeddings.weight", "lm_head.weight"]
+
+    def __init__(self, config: XLMProphetNetConfig):
+        super().__init__(config)
+        self.prophetnet = XLMProphetNetModel(config)
+        self.padding_idx = config.pad_token_id
+        self.disable_ngram_loss = config.disable_ngram_loss
+
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+    def set_output_embeddings(self, new_embeddings):
+        self.lm_head = new_embeddings
+
+    def _tie_weights(self):
+        if self.config.tie_word_embeddings:
+            self._tie_or_clone_weights(self.prophetnet.word_embeddings, self.lm_head)
+
+    def get_input_embeddings(self):
+        return self.prophetnet.word_embeddings
+
+    @add_start_docstrings_to_model_forward(XLM_PROPHETNET_INPUTS_DOCSTRING)
+    @replace_return_docstrings(output_type=XLMProphetNetSeq2SeqLMOutput, config_class=_CONFIG_FOR_DOC)
+    def forward(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        decoder_input_ids: Optional[torch.Tensor] = None,
+        decoder_attention_mask: Optional[torch.BoolTensor] = None,
+        head_mask: Optional[torch.Tensor] = None,
+        decoder_head_mask: Optional[torch.Tensor] = None,
+        cross_attn_head_mask: Optional[torch.Tensor] = None,
+        encoder_outputs: Optional[torch.Tensor] = None,
+        past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        decoder_inputs_embeds: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+    ) -> Union[Tuple, XLMProphetNetSeq2SeqLMOutput]:
+        r"""
+        labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
+            Labels for computing the sequence classification/regression loss. Indices should be in `[-100, 0, ...,
+            config.vocab_size - 1]`. All labels set to `-100` are ignored (masked), the loss is only computed for
+            labels in `[0, ..., config.vocab_size]`
+
+        Returns:
+
+        Example:
+
+        ```python
+        >>> from transformers import AutoTokenizer, XLMProphetNetForConditionalGeneration
+
+        >>> tokenizer = AutoTokenizer.from_pretrained("patrickvonplaten/xprophetnet-large-uncased-standalone")
+        >>> model = XLMProphetNetForConditionalGeneration.from_pretrained("patrickvonplaten/xprophetnet-large-uncased-standalone")
+
+        >>> input_ids = tokenizer(
+        ...     "Studies have been shown that owning a dog is good for you", return_tensors="pt"
+        ... ).input_ids  # Batch size 1
+        >>> decoder_input_ids = tokenizer("Studies show that", return_tensors="pt").input_ids  # Batch size 1
+        >>> outputs = model(input_ids=input_ids, decoder_input_ids=decoder_input_ids)
+
+        >>> logits_next_token = outputs.logits  # logits to predict next token as usual
+        >>> logits_ngram_next_tokens = outputs.logits_ngram  # logits to predict 2nd, 3rd, ... next tokens
+        ```"""
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        if labels is not None and decoder_input_ids is None and decoder_inputs_embeds is None:
+            # get decoder inputs from shifting lm labels to the right
+            decoder_input_ids = self._shift_right(labels)
+
+        outputs = self.prophetnet(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            decoder_input_ids=decoder_input_ids,
+            decoder_attention_mask=decoder_attention_mask,
+            head_mask=head_mask,
+            decoder_head_mask=decoder_head_mask,
+            cross_attn_head_mask=cross_attn_head_mask,
+            encoder_outputs=encoder_outputs,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            decoder_inputs_embeds=decoder_inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+        batch_size, sequence_length = (
+            decoder_input_ids.shape if decoder_input_ids is not None else decoder_inputs_embeds.shape[:2]
+        )
+
+        predicting_streams = outputs[1].view(batch_size, self.config.ngram, sequence_length, -1)
+        predict_logits = self.lm_head(predicting_streams)
+
+        logits = predict_logits[:, 0]
+        logits_ngram = predict_logits[:, 1:] if self.config.ngram > 1 else None
+
+        # To use .view in loss computation, make sure that logits is contiguous.
+        if not logits.is_contiguous():
+            logits = logits.contiguous()
+
+        loss = None
+        if labels is not None:
+            loss = self._compute_loss(predict_logits, labels)
+
+        if not return_dict:
+            all_logits = tuple(v for v in [logits, logits_ngram] if v is not None)
+            return (loss,) + all_logits + outputs[2:] if loss is not None else all_logits + outputs[2:]
+        else:
+            return XLMProphetNetSeq2SeqLMOutput(
+                loss=loss,
+                logits=logits,
+                logits_ngram=logits_ngram,
+                past_key_values=outputs.past_key_values,
+                decoder_hidden_states=outputs.decoder_hidden_states,
+                decoder_ngram_hidden_states=outputs.decoder_ngram_hidden_states,
+                decoder_attentions=outputs.decoder_attentions,
+                decoder_ngram_attentions=outputs.decoder_ngram_attentions,
+                cross_attentions=outputs.cross_attentions,
+                encoder_last_hidden_state=outputs.encoder_last_hidden_state,
+                encoder_hidden_states=outputs.encoder_hidden_states,
+                encoder_attentions=outputs.encoder_attentions,
+            )
+
+    def _compute_loss(self, logits, labels, ignore_index=-100):
+        expend_targets = labels.new_zeros(self.config.ngram, labels.size(0), labels.size(1)).fill_(ignore_index)
+
+        for i in range(self.config.ngram):
+            if i > 0 and self.disable_ngram_loss:
+                break
+            expend_targets[i, :, :] = labels
+
+        logits = logits.transpose(0, 1).contiguous()
+        lprobs = nn.functional.log_softmax(
+            logits.view(-1, logits.size(-1)),
+            dim=-1,
+            dtype=torch.float32,
+        )
+
+        loss = nn.functional.nll_loss(lprobs, expend_targets.view(-1), reduction="mean")
+
+        if self.config.eps > 0.0:
+            smooth_loss = -lprobs.sum(dim=-1, keepdim=True)
+            non_masked_tokens = expend_targets.ne(ignore_index).view(-1)
+            smooth_loss = smooth_loss[non_masked_tokens]
+            smooth_loss = smooth_loss.mean()
+
+            eps_i = self.config.eps / lprobs.size(-1)
+            loss = (1.0 - self.config.eps) * loss + eps_i * smooth_loss
+
+        return loss
+
+    def prepare_inputs_for_generation(
+        self,
+        decoder_input_ids,
+        past_key_values=None,
+        attention_mask=None,
+        head_mask=None,
+        decoder_head_mask=None,
+        cross_attn_head_mask=None,
+        use_cache=None,
+        encoder_outputs=None,
+        **kwargs,
+    ):
+        assert encoder_outputs is not None, "`encoder_outputs` have to be passed for generation."
+
+        if past_key_values:
+            decoder_input_ids = decoder_input_ids[:, -1:]
+        # first step, decoder_cached_states are empty
+        return {
+            "input_ids": None,  # encoder_outputs is defined. input_ids not needed
+            "encoder_outputs": encoder_outputs,
+            "past_key_values": past_key_values,
+            "decoder_input_ids": decoder_input_ids,
+            "attention_mask": attention_mask,
+            "head_mask": head_mask,
+            "decoder_head_mask": decoder_head_mask,
+            "cross_attn_head_mask": cross_attn_head_mask,
+            "use_cache": use_cache,
+        }
+
+    def prepare_decoder_input_ids_from_labels(self, labels: torch.Tensor):
+        return self._shift_right(labels)
+
+    @staticmethod
+    def _reorder_cache(past_key_values, beam_idx):
+        reordered_past = ()
+        for layer_past in past_key_values:
+            # cached cross_attention states don't have to be reordered -> they are always the same
+            reordered_past += (
+                tuple(past_state.index_select(0, beam_idx.to(past_state.device)) for past_state in layer_past[:2])
+                + layer_past[2:],
+            )
+        return reordered_past
+
+    def get_encoder(self):
+        return self.prophetnet.encoder
+
+    def get_decoder(self):
+        return self.prophetnet.decoder
+
+
+@add_start_docstrings(
+    "The standalone decoder part of the XLMProphetNetModel with a lm head on top. The model can be used for causal"
+    " language modeling.",
+    XLM_PROPHETNET_START_DOCSTRING,
+)
+class XLMProphetNetForCausalLM(XLMProphetNetPreTrainedModel):
+    _tied_weights_keys = [
+        "prophetnet.word_embeddings.weight",
+        "prophetnet.decoder.word_embeddings.weight",
+        "lm_head.weight",
+    ]
+
+    def __init__(self, config: XLMProphetNetConfig):
+        # set config for CLM
+        config = copy.deepcopy(config)
+        config.is_decoder = True
+        config.is_encoder_decoder = False
+        super().__init__(config)
+        self.prophetnet = XLMProphetNetDecoderWrapper(config)
+
+        self.padding_idx = config.pad_token_id
+        self.disable_ngram_loss = config.disable_ngram_loss
+
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    def get_input_embeddings(self):
+        return self.prophetnet.decoder.word_embeddings
+
+    def set_input_embeddings(self, value):
+        self.prophetnet.decoder.word_embeddings = value
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+    def set_output_embeddings(self, new_embeddings):
+        self.lm_head = new_embeddings
+
+    def _tie_weights(self):
+        if self.config.tie_word_embeddings:
+            self._tie_or_clone_weights(self.prophetnet.decoder.word_embeddings, self.lm_head)
+
+    def set_decoder(self, decoder):
+        self.prophetnet.decoder = decoder
+
+    def get_decoder(self):
+        return self.prophetnet.decoder
+
+    @add_start_docstrings_to_model_forward(XLM_PROPHETNET_STANDALONE_INPUTS_DOCSTRING

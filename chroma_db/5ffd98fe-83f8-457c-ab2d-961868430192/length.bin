@@ -1,0 +1,739 @@
+ encoder_hidden_states=encoder_outputs[0],
+            head_mask=decoder_head_mask,
+            cross_attn_head_mask=cross_attn_head_mask,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            cache_position=cache_position,
+        )
+
+        if not return_dict:
+            return decoder_outputs + encoder_outputs + (loc, scale, static_feat)
+
+        return Seq2SeqTSModelOutput(
+            last_hidden_state=decoder_outputs.last_hidden_state,
+            past_key_values=decoder_outputs.past_key_values,
+            decoder_hidden_states=decoder_outputs.hidden_states,
+            decoder_attentions=decoder_outputs.attentions,
+            cross_attentions=decoder_outputs.cross_attentions,
+            encoder_last_hidden_state=encoder_outputs.last_hidden_state,
+            encoder_hidden_states=encoder_outputs.hidden_states,
+            encoder_attentions=encoder_outputs.attentions,
+            loc=loc,
+            scale=scale,
+            static_features=static_feat,
+        )
+
+
+@auto_docstring
+class TimeSeriesTransformerForPrediction(TimeSeriesTransformerPreTrainedModel):
+    def __init__(self, config: TimeSeriesTransformerConfig):
+        super().__init__(config)
+        self.model = TimeSeriesTransformerModel(config)
+        if config.distribution_output == "student_t":
+            self.distribution_output = StudentTOutput(dim=config.input_size)
+        elif config.distribution_output == "normal":
+            self.distribution_output = NormalOutput(dim=config.input_size)
+        elif config.distribution_output == "negative_binomial":
+            self.distribution_output = NegativeBinomialOutput(dim=config.input_size)
+        else:
+            raise ValueError(f"Unknown distribution output {config.distribution_output}")
+
+        self.parameter_projection = self.distribution_output.get_parameter_projection(self.model.config.d_model)
+        self.target_shape = self.distribution_output.event_shape
+
+        if config.loss == "nll":
+            self.loss = nll
+        else:
+            raise ValueError(f"Unknown loss function {config.loss}")
+
+        # Initialize weights of distribution_output and apply final processing
+        self.post_init()
+
+    def output_params(self, dec_output):
+        return self.parameter_projection(dec_output)
+
+    def get_encoder(self):
+        return self.model.get_encoder()
+
+    def get_decoder(self):
+        return self.model.get_decoder()
+
+    @torch.jit.ignore
+    def output_distribution(self, params, loc=None, scale=None, trailing_n=None) -> torch.distributions.Distribution:
+        sliced_params = params
+        if trailing_n is not None:
+            sliced_params = [p[:, -trailing_n:] for p in params]
+        return self.distribution_output.distribution(sliced_params, loc=loc, scale=scale)
+
+    @auto_docstring
+    def forward(
+        self,
+        past_values: torch.Tensor,
+        past_time_features: torch.Tensor,
+        past_observed_mask: torch.Tensor,
+        static_categorical_features: Optional[torch.Tensor] = None,
+        static_real_features: Optional[torch.Tensor] = None,
+        future_values: Optional[torch.Tensor] = None,
+        future_time_features: Optional[torch.Tensor] = None,
+        future_observed_mask: Optional[torch.Tensor] = None,
+        decoder_attention_mask: Optional[torch.LongTensor] = None,
+        head_mask: Optional[torch.Tensor] = None,
+        decoder_head_mask: Optional[torch.Tensor] = None,
+        cross_attn_head_mask: Optional[torch.Tensor] = None,
+        encoder_outputs: Optional[List[torch.FloatTensor]] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        output_hidden_states: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        use_cache: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+    ) -> Union[Seq2SeqTSModelOutput, Tuple]:
+        r"""
+        past_values (`torch.FloatTensor` of shape `(batch_size, sequence_length)` or `(batch_size, sequence_length, input_size)`):
+            Past values of the time series, that serve as context in order to predict the future. The sequence size of
+            this tensor must be larger than the `context_length` of the model, since the model will use the larger size
+            to construct lag features, i.e. additional values from the past which are added in order to serve as "extra
+            context".
+
+            The `sequence_length` here is equal to `config.context_length` + `max(config.lags_sequence)`, which if no
+            `lags_sequence` is configured, is equal to `config.context_length` + 7 (as by default, the largest
+            look-back index in `config.lags_sequence` is 7). The property `_past_length` returns the actual length of
+            the past.
+
+            The `past_values` is what the Transformer encoder gets as input (with optional additional features, such as
+            `static_categorical_features`, `static_real_features`, `past_time_features` and lags).
+
+            Optionally, missing values need to be replaced with zeros and indicated via the `past_observed_mask`.
+
+            For multivariate time series, the `input_size` > 1 dimension is required and corresponds to the number of
+            variates in the time series per time step.
+        past_time_features (`torch.FloatTensor` of shape `(batch_size, sequence_length, num_features)`):
+            Required time features, which the model internally will add to `past_values`. These could be things like
+            "month of year", "day of the month", etc. encoded as vectors (for instance as Fourier features). These
+            could also be so-called "age" features, which basically help the model know "at which point in life" a
+            time-series is. Age features have small values for distant past time steps and increase monotonically the
+            more we approach the current time step. Holiday features are also a good example of time features.
+
+            These features serve as the "positional encodings" of the inputs. So contrary to a model like BERT, where
+            the position encodings are learned from scratch internally as parameters of the model, the Time Series
+            Transformer requires to provide additional time features. The Time Series Transformer only learns
+            additional embeddings for `static_categorical_features`.
+
+            Additional dynamic real covariates can be concatenated to this tensor, with the caveat that these features
+            must but known at prediction time.
+
+            The `num_features` here is equal to `config.`num_time_features` + `config.num_dynamic_real_features`.
+        past_observed_mask (`torch.BoolTensor` of shape `(batch_size, sequence_length)` or `(batch_size, sequence_length, input_size)`, *optional*):
+            Boolean mask to indicate which `past_values` were observed and which were missing. Mask values selected in
+            `[0, 1]`:
+
+            - 1 for values that are **observed**,
+            - 0 for values that are **missing** (i.e. NaNs that were replaced by zeros).
+        static_categorical_features (`torch.LongTensor` of shape `(batch_size, number of static categorical features)`, *optional*):
+            Optional static categorical features for which the model will learn an embedding, which it will add to the
+            values of the time series.
+
+            Static categorical features are features which have the same value for all time steps (static over time).
+
+            A typical example of a static categorical feature is a time series ID.
+        static_real_features (`torch.FloatTensor` of shape `(batch_size, number of static real features)`, *optional*):
+            Optional static real features which the model will add to the values of the time series.
+
+            Static real features are features which have the same value for all time steps (static over time).
+
+            A typical example of a static real feature is promotion information.
+        future_values (`torch.FloatTensor` of shape `(batch_size, prediction_length)` or `(batch_size, prediction_length, input_size)`, *optional*):
+            Future values of the time series, that serve as labels for the model. The `future_values` is what the
+            Transformer needs during training to learn to output, given the `past_values`.
+
+            The sequence length here is equal to `prediction_length`.
+
+            See the demo notebook and code snippets for details.
+
+            Optionally, during training any missing values need to be replaced with zeros and indicated via the
+            `future_observed_mask`.
+
+            For multivariate time series, the `input_size` > 1 dimension is required and corresponds to the number of
+            variates in the time series per time step.
+        future_time_features (`torch.FloatTensor` of shape `(batch_size, prediction_length, num_features)`):
+            Required time features for the prediction window, which the model internally will add to `future_values`.
+            These could be things like "month of year", "day of the month", etc. encoded as vectors (for instance as
+            Fourier features). These could also be so-called "age" features, which basically help the model know "at
+            which point in life" a time-series is. Age features have small values for distant past time steps and
+            increase monotonically the more we approach the current time step. Holiday features are also a good example
+            of time features.
+
+            These features serve as the "positional encodings" of the inputs. So contrary to a model like BERT, where
+            the position encodings are learned from scratch internally as parameters of the model, the Time Series
+            Transformer requires to provide additional time features. The Time Series Transformer only learns
+            additional embeddings for `static_categorical_features`.
+
+            Additional dynamic real covariates can be concatenated to this tensor, with the caveat that these features
+            must but known at prediction time.
+
+            The `num_features` here is equal to `config.`num_time_features` + `config.num_dynamic_real_features`.
+        future_observed_mask (`torch.BoolTensor` of shape `(batch_size, sequence_length)` or `(batch_size, sequence_length, input_size)`, *optional*):
+            Boolean mask to indicate which `future_values` were observed and which were missing. Mask values selected
+            in `[0, 1]`:
+
+            - 1 for values that are **observed**,
+            - 0 for values that are **missing** (i.e. NaNs that were replaced by zeros).
+
+            This mask is used to filter out missing values for the final loss calculation.
+        cross_attn_head_mask (`torch.Tensor` of shape `(decoder_layers, decoder_attention_heads)`, *optional*):
+            Mask to nullify selected heads of the cross-attention modules. Mask values selected in `[0, 1]`:
+
+            - 1 indicates the head is **not masked**,
+            - 0 indicates the head is **masked**.
+        encoder_outputs (`tuple(tuple(torch.FloatTensor)`, *optional*):
+            Tuple consists of `last_hidden_state`, `hidden_states` (*optional*) and `attentions` (*optional*)
+            `last_hidden_state` of shape `(batch_size, sequence_length, hidden_size)` (*optional*) is a sequence of
+            hidden-states at the output of the last layer of the encoder. Used in the cross-attention of the decoder.
+
+        Examples:
+
+        ```python
+        >>> from huggingface_hub import hf_hub_download
+        >>> import torch
+        >>> from transformers import TimeSeriesTransformerForPrediction
+
+        >>> file = hf_hub_download(
+        ...     repo_id="hf-internal-testing/tourism-monthly-batch", filename="train-batch.pt", repo_type="dataset"
+        ... )
+        >>> batch = torch.load(file)
+
+        >>> model = TimeSeriesTransformerForPrediction.from_pretrained(
+        ...     "huggingface/time-series-transformer-tourism-monthly"
+        ... )
+
+        >>> # during training, one provides both past and future values
+        >>> # as well as possible additional features
+        >>> outputs = model(
+        ...     past_values=batch["past_values"],
+        ...     past_time_features=batch["past_time_features"],
+        ...     past_observed_mask=batch["past_observed_mask"],
+        ...     static_categorical_features=batch["static_categorical_features"],
+        ...     static_real_features=batch["static_real_features"],
+        ...     future_values=batch["future_values"],
+        ...     future_time_features=batch["future_time_features"],
+        ... )
+
+        >>> loss = outputs.loss
+        >>> loss.backward()
+
+        >>> # during inference, one only provides past values
+        >>> # as well as possible additional features
+        >>> # the model autoregressively generates future values
+        >>> outputs = model.generate(
+        ...     past_values=batch["past_values"],
+        ...     past_time_features=batch["past_time_features"],
+        ...     past_observed_mask=batch["past_observed_mask"],
+        ...     static_categorical_features=batch["static_categorical_features"],
+        ...     static_real_features=batch["static_real_features"],
+        ...     future_time_features=batch["future_time_features"],
+        ... )
+
+        >>> mean_prediction = outputs.sequences.mean(dim=1)
+        ```"""
+
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        if future_values is not None:
+            use_cache = False
+
+        outputs = self.model(
+            past_values=past_values,
+            past_time_features=past_time_features,
+            past_observed_mask=past_observed_mask,
+            static_categorical_features=static_categorical_features,
+            static_real_features=static_real_features,
+            future_values=future_values,
+            future_time_features=future_time_features,
+            decoder_attention_mask=decoder_attention_mask,
+            head_mask=head_mask,
+            decoder_head_mask=decoder_head_mask,
+            cross_attn_head_mask=cross_attn_head_mask,
+            encoder_outputs=encoder_outputs,
+            past_key_values=past_key_values,
+            output_hidden_states=output_hidden_states,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+            return_dict=return_dict,
+            cache_position=cache_position,
+        )
+
+        prediction_loss = None
+        params = None
+        if future_values is not None:
+            params = self.output_params(outputs[0])  # outputs.last_hidden_state
+            # loc is 3rd last and scale is 2nd last output
+            distribution = self.output_distribution(params, loc=outputs[-3], scale=outputs[-2])
+
+            loss = self.loss(distribution, future_values)
+
+            if future_observed_mask is None:
+                future_observed_mask = torch.ones_like(future_values)
+
+            if len(self.target_shape) == 0:
+                loss_weights = future_observed_mask
+            else:
+                loss_weights, _ = future_observed_mask.min(dim=-1, keepdim=False)
+
+            prediction_loss = weighted_average(loss, weights=loss_weights)
+
+        if not return_dict:
+            outputs = ((params,) + outputs[1:]) if params is not None else outputs[1:]
+            return ((prediction_loss,) + outputs) if prediction_loss is not None else outputs
+
+        return Seq2SeqTSPredictionOutput(
+            loss=prediction_loss,
+            params=params,
+            past_key_values=outputs.past_key_values,
+            decoder_hidden_states=outputs.decoder_hidden_states,
+            decoder_attentions=outputs.decoder_attentions,
+            cross_attentions=outputs.cross_attentions,
+            encoder_last_hidden_state=outputs.encoder_last_hidden_state,
+            encoder_hidden_states=outputs.encoder_hidden_states,
+            encoder_attentions=outputs.encoder_attentions,
+            loc=outputs.loc,
+            scale=outputs.scale,
+            static_features=outputs.static_features,
+        )
+
+    @torch.no_grad()
+    def generate(
+        self,
+        past_values: torch.Tensor,
+        past_time_features: torch.Tensor,
+        future_time_features: torch.Tensor,
+        past_observed_mask: Optional[torch.Tensor] = None,
+        static_categorical_features: Optional[torch.Tensor] = None,
+        static_real_features: Optional[torch.Tensor] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+    ) -> SampleTSPredictionOutput:
+        r"""
+        Greedily generate sequences of sample predictions from a model with a probability distribution head.
+
+        Parameters:
+            past_values (`torch.FloatTensor` of shape `(batch_size, sequence_length)` or `(batch_size, sequence_length, input_size)`):
+                Past values of the time series, that serve as context in order to predict the future. The sequence size
+                of this tensor must be larger than the `context_length` of the model, since the model will use the
+                larger size to construct lag features, i.e. additional values from the past which are added in order to
+                serve as "extra context".
+
+                The `sequence_length` here is equal to `config.context_length` + `max(config.lags_sequence)`, which if
+                no `lags_sequence` is configured, is equal to `config.context_length` + 7 (as by default, the largest
+                look-back index in `config.lags_sequence` is 7). The property `_past_length` returns the actual length
+                of the past.
+
+                The `past_values` is what the Transformer encoder gets as input (with optional additional features,
+                such as `static_categorical_features`, `static_real_features`, `past_time_features` and lags).
+
+                Optionally, missing values need to be replaced with zeros and indicated via the `past_observed_mask`.
+
+                For multivariate time series, the `input_size` > 1 dimension is required and corresponds to the number
+                of variates in the time series per time step.
+            past_time_features (`torch.FloatTensor` of shape `(batch_size, sequence_length, num_features)`):
+                Required time features, which the model internally will add to `past_values`. These could be things
+                like "month of year", "day of the month", etc. encoded as vectors (for instance as Fourier features).
+                These could also be so-called "age" features, which basically help the model know "at which point in
+                life" a time-series is. Age features have small values for distant past time steps and increase
+                monotonically the more we approach the current time step. Holiday features are also a good example of
+                time features.
+
+                These features serve as the "positional encodings" of the inputs. So contrary to a model like BERT,
+                where the position encodings are learned from scratch internally as parameters of the model, the Time
+                Series Transformer requires to provide additional time features. The Time Series Transformer only
+                learns additional embeddings for `static_categorical_features`.
+
+                Additional dynamic real covariates can be concatenated to this tensor, with the caveat that these
+                features must but known at prediction time.
+
+                The `num_features` here is equal to `config.`num_time_features` + `config.num_dynamic_real_features`.
+            future_time_features (`torch.FloatTensor` of shape `(batch_size, prediction_length, num_features)`):
+                Required time features for the prediction window, which the model internally will add to sampled
+                predictions. These could be things like "month of year", "day of the month", etc. encoded as vectors
+                (for instance as Fourier features). These could also be so-called "age" features, which basically help
+                the model know "at which point in life" a time-series is. Age features have small values for distant
+                past time steps and increase monotonically the more we approach the current time step. Holiday features
+                are also a good example of time features.
+
+                These features serve as the "positional encodings" of the inputs. So contrary to a model like BERT,
+                where the position encodings are learned from scratch internally as parameters of the model, the Time
+                Series Transformer requires to provide additional time features. The Time Series Transformer only
+                learns additional embeddings for `static_categorical_features`.
+
+                Additional dynamic real covariates can be concatenated to this tensor, with the caveat that these
+                features must but known at prediction time.
+
+                The `num_features` here is equal to `config.`num_time_features` + `config.num_dynamic_real_features`.
+            past_observed_mask (`torch.BoolTensor` of shape `(batch_size, sequence_length)` or `(batch_size, sequence_length, input_size)`, *optional*):
+                Boolean mask to indicate which `past_values` were observed and which were missing. Mask values selected
+                in `[0, 1]`:
+
+                - 1 for values that are **observed**,
+                - 0 for values that are **missing** (i.e. NaNs that were replaced by zeros).
+
+            static_categorical_features (`torch.LongTensor` of shape `(batch_size, number of static categorical features)`, *optional*):
+                Optional static categorical features for which the model will learn an embedding, which it will add to
+                the values of the time series.
+
+                Static categorical features are features which have the same value for all time steps (static over
+                time).
+
+                A typical example of a static categorical feature is a time series ID.
+            static_real_features (`torch.FloatTensor` of shape `(batch_size, number of static real features)`, *optional*):
+                Optional static real features which the model will add to the values of the time series.
+
+                Static real features are features which have the same value for all time steps (static over time).
+
+                A typical example of a static real feature is promotion information.
+            output_attentions (`bool`, *optional*):
+                Whether or not to return the attentions tensors of all attention layers.
+            output_hidden_states (`bool`, *optional*):
+                Whether or not to return the hidden states of all layers.
+
+        Return:
+            [`SampleTSPredictionOutput`] where the outputs `sequences` tensor will have shape `(batch_size, number of
+            samples, prediction_length)` or `(batch_size, number of samples, prediction_length, input_size)` for
+            multivariate predictions.
+        """
+        outputs = self(
+            static_categorical_features=static_categorical_features,
+            static_real_features=static_real_features,
+            past_time_features=past_time_features,
+            past_values=past_values,
+            past_observed_mask=past_observed_mask,
+            future_time_features=future_time_features,
+            future_values=None,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=True,
+            use_cache=True,
+        )
+
+        decoder = self.model.get_decoder()
+        enc_last_hidden = outputs.encoder_last_hidden_state
+        loc = outputs.loc
+        scale = outputs.scale
+        static_feat = outputs.static_features
+
+        num_parallel_samples = self.config.num_parallel_samples
+        repeated_loc = loc.repeat_interleave(repeats=num_parallel_samples, dim=0)
+        repeated_scale = scale.repeat_interleave(repeats=num_parallel_samples, dim=0)
+
+        repeated_past_values = (
+            past_values.repeat_interleave(repeats=num_parallel_samples, dim=0) - repeated_loc
+        ) / repeated_scale
+
+        expanded_static_feat = static_feat.unsqueeze(1).expand(-1, future_time_features.shape[1], -1)
+        features = torch.cat((expanded_static_feat, future_time_features), dim=-1)
+        repeated_features = features.repeat_interleave(repeats=num_parallel_samples, dim=0)
+
+        repeated_enc_last_hidden = enc_last_hidden.repeat_interleave(repeats=num_parallel_samples, dim=0)
+
+        future_samples = []
+
+        # greedy decoding
+        for k in range(self.config.prediction_length):
+            lagged_sequence = self.model.get_lagged_subsequences(
+                sequence=repeated_past_values,
+                subsequences_length=1 + k,
+                shift=1,
+            )
+
+            lags_shape = lagged_sequence.shape
+            reshaped_lagged_sequence = lagged_sequence.reshape(lags_shape[0], lags_shape[1], -1)
+
+            decoder_input = torch.cat((reshaped_lagged_sequence, repeated_features[:, : k + 1]), dim=-1)
+
+            dec_output = decoder(inputs_embeds=decoder_input, encoder_hidden_states=repeated_enc_last_hidden)
+            dec_last_hidden = dec_output.last_hidden_state
+
+            params = self.parameter_projection(dec_last_hidden[:, -1:])
+            distr = self.output_distribution(params, loc=repeated_loc, scale=repeated_scale)
+            next_sample = distr.sample()
+
+            repeated_past_values = torch.cat(
+                (repeated_past_values, (next_sample - repeated_loc) / repeated_scale), dim=1
+            )
+            future_samples.append(next_sample)
+
+        concat_future_samples = torch.cat(future_samples, dim=1)
+
+        return SampleTSPredictionOutput(
+            sequences=concat_future_samples.reshape(
+                (-1, num_parallel_samples, self.config.prediction_length) + self.target_shape,
+            )
+        )
+
+
+__all__ = ["TimeSeriesTransformerForPrediction", "TimeSeriesTransformerModel", "TimeSeriesTransformerPreTrainedModel"]
+  the output will be an element-wise
+        maximum of vectors rather than scalars.
+    Only the middle dimensions [I1, ..., Ik] are reduced by the operation.
+
+    Args:
+      values: [B1, B2, ..., Bn, I1, .., Ik, V1, V2, ..] tensor of values to be
+        averaged.
+      index: IndexMap [B1, B2, ..., Bn, I1, .., Ik] index defining the segments.
+      name: Name for the TensorFlow ops.
+
+    Returns:
+      A pair (output_values, output_index) where `output_values` is a tensor of shape [B1, B2, ..., Bn, num_segments,
+      V1, V2, ..] and `index` is an IndexMap with shape [B1, B2, ..., Bn, num_segments].
+    """
+    return _segment_reduce(values, index, tf.math.unsorted_segment_max, name)
+
+
+def reduce_min(values, index, name="segmented_reduce_min"):
+    """Computes the minimum over segments."""
+    return _segment_reduce(values, index, tf.math.unsorted_segment_min, name)
+
+
+def _single_column_cell_selection_loss(token_logits, column_logits, labels, cell_index, col_index, cell_mask):
+    """
+    Computes the loss for cell selection constrained to a single column. The loss is a hierarchical log-likelihood. The
+    model first predicts a column and then selects cells within that column (conditioned on the column). Cells outside
+    the selected column are never selected.
+
+    Args:
+        token_logits (`tf.Tensor` of shape `(batch_size, sequence_length)`):
+            Tensor containing the logits per token.
+        column_logits (`tf.Tensor` of shape `(batch_size, max_num_cols)`):
+            Tensor containing the logits per column.
+        labels (`tf.Tensor` of shape `(batch_size, sequence_length)`):
+            Labels per token.
+        cell_index (`ProductIndexMap`):
+            Index that groups tokens into cells.
+        col_index (`IndexMap`):
+            Index that groups tokens into columns.
+        cell_mask (`tf.Tensor` of shape `(batch_size, max_num_rows * max_num_cols)`):
+            Mask for cells that exist in the table (i.e. that are not padding).
+
+    Returns:
+        selection_loss_per_example (`tf.Tensor` of shape `(batch_size,)`): Loss for each example. logits (`tf.Tensor`
+        of shape `(batch_size, sequence_length)`): New logits which are only allowed to select cells in a single
+        column. Logits outside of the most likely column according to *column_logits* will be set to a very low value
+        (such that the probabilities are 0).
+    """
+    # First find the column we should select. We use the column with maximum
+    # number of selected cells.
+    labels_per_column, _ = reduce_sum(tf.cast(labels, tf.float32), col_index)
+    column_label = tf.argmax(labels_per_column, axis=-1, output_type=tf.int32)
+    # Check if there are no selected cells in the column. In that case the model
+    # should predict the special column id 0, which means "select nothing".
+    no_cell_selected = tf.equal(tf.reduce_max(labels_per_column, axis=-1), 0)
+    column_label = tf.where(no_cell_selected, tf.zeros_like(column_label), column_label)
+
+    column_dist = tfp.distributions.Categorical(logits=column_logits)
+    column_loss_per_example = -column_dist.log_prob(column_label)
+
+    # Reduce the labels and logits to per-cell from per-token.
+    logits_per_cell, _ = reduce_mean(token_logits, cell_index)
+    labels_per_cell, labels_index = reduce_max(tf.cast(labels, tf.int32), cell_index)
+
+    # Mask for the selected column.
+    column_id_for_cells = cell_index.project_inner(labels_index).indices
+    column_mask = tf.cast(tf.equal(column_id_for_cells, tf.expand_dims(column_label, axis=1)), tf.float32)
+
+    # Compute the log-likelihood for cells, but only for the selected column.
+    cell_dist = tfp.distributions.Bernoulli(logits=logits_per_cell)
+    cell_log_prob = cell_dist.log_prob(labels_per_cell)
+    cell_loss = -tf.reduce_sum(cell_log_prob * column_mask * cell_mask, axis=1)
+    # We need to normalize the loss by the number of cells in the column.
+    cell_loss /= tf.reduce_sum(column_mask * cell_mask, axis=1) + EPSILON_ZERO_DIVISION
+
+    selection_loss_per_example = column_loss_per_example
+    selection_loss_per_example += tf.where(no_cell_selected, tf.zeros_like(selection_loss_per_example), cell_loss)
+
+    # Set the probs outside the selected column (selected by the *model*)
+    # to 0. This ensures backwards compatibility with models that select
+    # cells from multiple columns.
+    selected_column_id = tf.argmax(column_logits, axis=-1, output_type=tf.int32)
+    selected_column_mask = tf.cast(
+        tf.equal(column_id_for_cells, tf.expand_dims(selected_column_id, axis=-1)), tf.float32
+    )
+    # Never select cells with the special column id 0.
+    selected_column_mask = tf.where(
+        tf.equal(column_id_for_cells, 0), tf.zeros_like(selected_column_mask), selected_column_mask
+    )
+    logits_per_cell += CLOSE_ENOUGH_TO_LOG_ZERO * (1.0 - cell_mask * selected_column_mask)
+    logits = gather(logits_per_cell, cell_index)
+
+    return selection_loss_per_example, logits
+
+
+def _calculate_aggregate_mask(answer, pooled_output, cell_selection_preference, labels, aggregation_classifier):
+    """
+    Finds examples where the model should select cells with no aggregation.
+
+    Returns a mask that determines for which examples should the model select answers directly from the table, without
+    any aggregation function. If the answer is a piece of text the case is unambiguous as aggregation functions only
+    apply to numbers. If the answer is a number but does not appear in the table then we must use some aggregation
+    case. The ambiguous case is when the answer is a number that also appears in the table. In this case we use the
+    aggregation function probabilities predicted by the model to decide whether to select or aggregate. The threshold
+    for this is a hyperparameter *cell_selection_preference*
+
+    Args:
+        answer (`tf.Tensor` of shape `(batch_size, )`):
+            Answer for every example in the batch. Nan if there is no scalar answer.
+        pooled_output (`tf.Tensor` of shape `(batch_size, hidden_size)`):
+            Output of the pooler (BertPooler) on top of the encoder layer.
+        cell_selection_preference (`float`):
+            Preference for cell selection in ambiguous cases.
+        labels (`tf.Tensor` of shape `(batch_size, sequence_length)`):
+            Labels per token. aggregation_classifier (`torch.nn.Linear`): Aggregation head
+
+    Returns:
+        aggregate_mask (`tf.Tensor` of shape `(batch_size,)`): A mask set to 1 for examples that should use aggregation
+        functions.
+    """
+    # tf.Tensor(batch_size,)
+    aggregate_mask_init = tf.cast(tf.logical_not(tf.math.is_nan(answer)), tf.float32)
+    logits_aggregation = aggregation_classifier(pooled_output)
+    dist_aggregation = tfp.distributions.Categorical(logits=logits_aggregation)
+    # Index 0 corresponds to "no aggregation".
+    aggregation_ops_total_mass = tf.reduce_sum(dist_aggregation.probs_parameter()[:, 1:], axis=1)
+    # Cell selection examples according to current model.
+    is_pred_cell_selection = aggregation_ops_total_mass <= cell_selection_preference
+    # Examples with non-empty cell selection supervision.
+    is_cell_supervision_available = tf.reduce_sum(labels, axis=1) > 0
+    aggregate_mask = tf.where(
+        tf.logical_and(is_pred_cell_selection, is_cell_supervision_available),
+        tf.zeros_like(aggregate_mask_init, dtype=tf.float32),
+        aggregate_mask_init,
+    )
+    aggregate_mask = tf.stop_gradient(aggregate_mask)
+    return aggregate_mask
+
+
+def _calculate_aggregation_loss_known(
+    logits_aggregation, aggregate_mask, aggregation_labels, use_answer_as_supervision, num_aggregation_labels
+):
+    """
+    Calculates aggregation loss when its type is known during training.
+
+    In the weakly supervised setting, the only known information is that for cell selection examples, "no aggregation"
+    should be predicted. For other examples (those that require aggregation), no loss is accumulated. In the setting
+    where aggregation type is always known, standard cross entropy loss is accumulated for all examples
+
+    Args:
+        logits_aggregation (`tf.Tensor` of shape `(batch_size, num_aggregation_labels)`):
+            Logits per aggregation operation.
+        aggregate_mask (`tf.Tensor` of shape `(batch_size, )`):
+            A mask set to 1 for examples that should use aggregation functions.
+        aggregation_labels (`tf.Tensor` of shape `(batch_size, )`):
+            Aggregation function id for every example in the batch.
+        use_answer_as_supervision (`bool`, *optional*):
+            Whether to use the answer as the only supervision for aggregation examples.
+        num_aggregation_labels (`int`, *optional*, defaults to 0):
+            The number of aggregation operators to predict.
+
+    Returns:
+        aggregation_loss_known (`tf.Tensor` of shape `(batch_size,)`): Aggregation loss (when its type is known during
+        training) per example.
+    """
+    if use_answer_as_supervision:
+        # Prepare "no aggregation" targets for cell selection examples.
+        target_aggregation = tf.zeros_like(aggregate_mask, dtype=tf.int32)
+    else:
+        # Use aggregation supervision as the target.
+        target_aggregation = aggregation_labels
+
+    one_hot_labels = tf.one_hot(target_aggregation, depth=num_aggregation_labels, dtype=tf.float32)
+    log_probs = tf.nn.log_softmax(logits_aggregation, axis=-1)
+
+    # <float32>[batch_size]
+    per_example_aggregation_intermediate = -tf.reduce_sum(one_hot_labels * log_probs, axis=-1)
+    if use_answer_as_supervision:
+        # Accumulate loss only for examples requiring cell selection
+        # (no aggregation).
+        return per_example_aggregation_intermediate * (1 - aggregate_mask)
+    else:
+        return per_example_aggregation_intermediate
+
+
+def _calculate_aggregation_loss_unknown(logits_aggregation, aggregate_mask):
+    """
+    Calculates aggregation loss in the case of answer supervision.
+
+    Args:
+        logits_aggregation (`tf.Tensor` of shape `(batch_size, num_aggregation_labels)`):
+            Logits per aggregation operation.
+        aggregate_mask (`tf.Tensor` of shape `(batch_size, )`):
+            A mask set to 1 for examples that should use aggregation functions
+
+    Returns:
+        aggregation_loss_unknown (`tf.Tensor` of shape `(batch_size,)`): Aggregation loss (in case of answer
+        supervision) per example.
+    """
+    dist_aggregation = tfp.distributions.Categorical(logits=logits_aggregation)
+    # Index 0 corresponds to "no aggregation".
+    aggregation_ops_total_mass = tf.reduce_sum(dist_aggregation.probs_parameter()[:, 1:], axis=1)
+    # Predict some aggregation in case of an answer that needs aggregation.
+    # This increases the probability of all aggregation functions, in a way
+    # similar to MML, but without considering whether the function gives the
+    # correct answer.
+    return -tf.math.log(aggregation_ops_total_mass) * aggregate_mask
+
+
+def _calculate_aggregation_loss(
+    logits_aggregation,
+    aggregate_mask,
+    aggregation_labels,
+    use_answer_as_supervision,
+    num_aggregation_labels,
+    aggregation_loss_weight,
+):
+    """
+    Calculates the aggregation loss per example.
+
+    Args:
+        logits_aggregation (`tf.Tensor` of shape `(batch_size, num_aggregation_labels)`):
+            Logits per aggregation operation.
+        aggregate_mask (`tf.Tensor` of shape `(batch_size, )`):
+            A mask set to 1 for examples that should use aggregation functions.
+        aggregation_labels (`tf.Tensor` of shape `(batch_size, )`):
+            Aggregation function id for every example in the batch.
+        use_answer_as_supervision (`bool`, *optional*):
+            Whether to use the answer as the only supervision for aggregation examples.
+        num_aggregation_labels (`int`, *optional*, defaults to 0):
+            The number of aggregation operators to predict.
+        aggregation_loss_weight (`float`, *optional*, defaults to 1.0):
+            Importance weight for the aggregation loss.
+
+    Returns:
+        aggregation_loss (`tf.Tensor` of shape `(batch_size,)`): Aggregation loss per example.
+    """
+    per_example_aggregation_loss = _calculate_aggregation_loss_known(
+        logits_aggregation, aggregate_mask, aggregation_labels, use_answer_as_supervision, num_aggregation_labels
+    )
+
+    if use_answer_as_supervision:
+        # Add aggregation loss for numeric answers that need aggregation.
+        per_example_aggregation_loss += _calculate_aggregation_loss_unknown(logits_aggregation, aggregate_mask)
+    return aggregation_loss_weight * per_example_aggregation_loss
+
+
+def _calculate_expected_result(
+    dist_per_cell, numeric_values, numeric_values_scale, input_mask_float, logits_aggregation, config
+):
+    """
+    Calculates the expected result given cell and aggregation probabilities.
+
+    Args:
+        dist_per_cell (`tfp.distributions.Bernoulli`):
+            Cell selection distribution for each cell.
+        numeric_values (`tf.Tensor` of shape `(batch_size, seq_length)`):
+            Numeric values of every token. Nan for tokens which are not numeric values.
+        numeric_values_scale (`tf.Tensor` of shape `(batch_size, seq_length)`):
+            Scale of the numeric values of every token.
+        input_mask_float (`tf.Tensor` of shape `(batch_size, seq_length)`):
+            Mask for the table, without question tokens and table headers.
+        logits_aggregation (`tf.Tensor` of shape `(batch_size, num_aggregation_labels)`):
+            Logits per aggregation operation.
+        config ([`TapasConfig`
