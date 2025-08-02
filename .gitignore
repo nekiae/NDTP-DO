@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+
+# Virtual environments
+venv/
+.env/
+.env*
+venv.bak/
+
+# Logs & outputs
+*.log
+logs/
+
+# MacOS
+.DS_Store
+
+# IDEs & editors
+.idea/
+.vscode/
+*.swp
+
+# Test & coverage reports
+.coverage*
+.cache/
+.pytest_cache/
+dist/
+build/
+
+# Jupyter notebooks checkpoints
+.ipynb_checkpoints/
+
+# Databases
+*.sqlite3
+*.db
+
+# Node
+node_modules/
+
+# Other
+Thumbs.db

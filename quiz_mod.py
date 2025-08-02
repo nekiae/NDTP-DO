@@ -155,6 +155,41 @@ async def ask_llm(history: list) -> Optional[str]:
         logger.error(f"❌ Ошибка запроса к DeepSeek: {e}")
         return "❌ Произошла ошибка при обработке запроса"
 
+# --- Helper functions to avoid premature recommendations/analysis before 5th answer ---
+
+def contains_early_recommendations(text: str) -> bool:
+    """Проверяет, содержит ли текст преждевременный анализ или рекомендации."""
+    keywords = [
+        "🎯",  # маркер анализа личности
+        "анализ твоей личности",
+        "рекомендуемые направления",
+        "главная рекомендация",
+        "📚",  # маркер списка направлений
+        "💡"
+    ]
+    lowered = text.lower()
+    return any(k.lower() in lowered for k in keywords)
+
+
+def strip_recommendations(text: str) -> str:
+    """Возвращает часть ответа до появления анализа/рекомендаций."""
+    delimiters = [
+        "🎯",
+        "📚",
+        "💡",
+        "анализ твоей личности",
+        "рекомендуемые направления"
+    ]
+    lowered = text.lower()
+    cut_idx = len(text)
+    for d in delimiters:
+        idx = lowered.find(d.lower())
+        if idx != -1 and idx < cut_idx:
+            cut_idx = idx
+    return text[:cut_idx].strip()
+
+# ------------------------------------------------------------------------------
+
 def create_quiz_keyboard() -> InlineKeyboardMarkup:
     """Создает клавиатуру для квиза"""
     builder = InlineKeyboardBuilder()
@@ -315,13 +350,26 @@ async def handle_quiz_question(message: Message, state: FSMContext, bot: Bot, cu
         else:
             # Получаем следующий вопрос
             response = await ask_llm(history)
+
+            # Проверяем, не появились ли рекомендации раньше времени
+            if current_state != "Q5" and response and contains_early_recommendations(response):
+                # Сначала пробуем обрезать лишнюю часть
+                cleaned = strip_recommendations(response)
+                if cleaned and len(cleaned) > 3:
+                    response = cleaned
+                else:
+                    # Если обрезать не удалось, запрашиваем модель повторно с уточнением
+                    history.append({"role": "assistant", "content": response})
+                    history.append({"role": "user", "content": "Ты дал рекомендации слишком рано. Пожалуйста, задай только следующий вопрос, без анализа и рекомендаций."})
+                    response = await ask_llm(history)
+
             if response:
                 await message.answer(
-                    response, 
+                    response,
                     parse_mode="Markdown",
                     reply_markup=create_quiz_keyboard()
                 )
-                
+
                 # Обновляем историю и состояние
                 history.append({"role": "assistant", "content": response})
                 await state.update_data(history=history)
