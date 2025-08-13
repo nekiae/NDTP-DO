@@ -40,3 +40,14 @@ node_modules/
 
 # Other
 Thumbs.db
+
+# Additional Python/tooling
+.python-version
+.mypy_cache/
+.ruff_cache/
+.pytype/
+pip-wheel-metadata/
+
+# Local data/temp
+data/
+tmp/

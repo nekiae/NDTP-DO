@@ -65,6 +65,22 @@ load_dotenv()
 from operator_handler import operator_handler, OperatorState, UserStatus
 from rag_system import rag_system
 
+# Роли: администраторы (из переменной окружения ADMIN_IDS="id1,id2,...")
+ADMIN_IDS_ENV = os.getenv("ADMIN_IDS", "").strip()
+ADMIN_IDS = set()
+if ADMIN_IDS_ENV:
+    for part in ADMIN_IDS_ENV.split(','):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            ADMIN_IDS.add(int(part))
+        except ValueError:
+            logger.warning(f"⚠️ Некорректный ID администратора в ADMIN_IDS: {part}")
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
 # Добавляем импорт парсера расписания
 from schedule_parser import get_schedule_context_async, get_schedule_context, force_update_schedule, schedule_updater_loop
 
@@ -106,7 +122,7 @@ except ImportError as e:
 
 # Импорт квиз модуля
 try:
-    from quiz_mod import register_quiz_handlers, get_quiz_stats, quiz_start_callback
+    from quiz_mod import register_quiz_handlers, get_quiz_stats, quiz_start_callback, quiz_start
     QUIZ_AVAILABLE = True
     logger.info("🎯 Квиз модуль загружен")
 except ImportError as e:
@@ -418,6 +434,31 @@ dp.message.middleware(HourlyLimitMiddleware(limit_per_hour=50))
 dp.callback_query.middleware(HourlyLimitMiddleware(limit_per_hour=50))
 logger.info("✅ Middleware установлен (50 запросов/час)")
 
+# Регистрируем команды бота в спец-меню Telegram
+async def on_startup_set_commands(bot: Bot):
+    try:
+        commands = [
+            types.BotCommand(command="start", description="Запустить бота"),
+            types.BotCommand(command="menu", description="Главное меню"),
+        ]
+        # По желанию пользователя — показываем основные функции
+        if CALENDAR_AVAILABLE:
+            commands.append(types.BotCommand(command="calendar", description="Календарь смен"))
+        if QUIZ_AVAILABLE:
+            commands.append(types.BotCommand(command="quiz", description="Квиз: подбор направления"))
+        if BRAINSTORM_AVAILABLE:
+            commands.append(types.BotCommand(command="brainstorm", description="Брейншторм идей"))
+        if LISTS_PARSER_AVAILABLE:
+            commands.append(types.BotCommand(command="checklists", description="Проверить списки"))
+        commands.append(types.BotCommand(command="help", description="Связаться с консультантом"))
+
+        await bot.set_my_commands(commands)
+        logger.info("✅ Команды бота зарегистрированы в спец-меню Telegram")
+    except Exception as e:
+        logger.error(f"❌ Не удалось установить команды бота: {e}")
+
+dp.startup.register(on_startup_set_commands)
+
 # Состояния FSM (дополнительные к OperatorState)
 class UserState(StatesGroup):
     IN_QUIZ = State()
@@ -630,17 +671,49 @@ async def get_enhanced_context(query: str) -> str:
 # Обработчики команд
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
-    """Приветственное сообщение с инлайн кнопками"""
+    """Стартовое приветствие по ролям: админ / оператор / пользователь"""
     user_id = message.from_user.id
     username = message.from_user.username or "без username"
     logger.info(f"🎯 Команда /start от пользователя {user_id} (@{username})")
-    
+
+    # Админ: отдельное приветствие и подсказки по функциям
+    if is_admin(user_id):
+        admin_text = (
+            "🛠 Админ-панель Технопарка\n\n"
+            "Доступные возможности:\n"
+            "• /queue — очередь пользователей (принятие заявок доступно операторам)\n"
+            "• /consultants_stats — сводная статистика по консультантам\n"
+            "• /operators — список операторов\n"
+            "• /notifications — статус системы уведомлений\n"
+            "• /update_schedule, /update_documents — обновление данных\n\n"
+            "Подсказка: используйте /help для теста эскалации в систему консультантов."
+        )
+        await message.answer(admin_text)
+        return
+
+    # Оператор: подробный гайд
+    if operator_handler.operator_manager.is_operator(user_id):
+        text = (
+            "👋 Добро пожаловать в панель консультанта!\n\n"
+            "Возможности:\n"
+            "• Уведомления о новых запросах c кнопкой: ✅ Принять запрос\n"
+            "• /queue — список очереди с возможностью принять заявку\n"
+            "• /consultants_stats — агрегированная статистика\n"
+            "• /operator_stats — ваша личная статистика\n"
+            "• /end_session — завершить текущую сессию\n\n"
+            "Во время сессии:\n"
+            "• Сообщения пользователя приходят как пересланные (с корректной подписью)\n"
+            "• Ваши ответы отправляются пользователю от имени консультанта\n"
+        )
+        await message.answer(text)
+        return
+
+    # Пользователь: обычное приветствие с меню
     welcome_text = (
         "👋 Добро пожаловать в бот Национального детского технопарка!\n\n"
         "🤖 Я ваш интеллектуальный помощник. Выберите интересующую вас тему:"
     )
-    
-    # Создаем инлайн клавиатуру
+
     keyboard_rows = [
         [
             InlineKeyboardButton(text="🏫 О технопарке", callback_data="info_about"),
@@ -650,37 +723,32 @@ async def cmd_start(message: Message):
             InlineKeyboardButton(text="📝 Поступление", callback_data="info_admission")
         ]
     ]
-    
-    # Добавляем кнопку брейншторма, если модуль доступен
+
     if BRAINSTORM_AVAILABLE:
         keyboard_rows.append([
             InlineKeyboardButton(text="🧠 Брейншторм идей", callback_data="start_brainstorm")
         ])
-    
-    # Добавляем кнопку календаря, если модуль доступен
+
     if CALENDAR_AVAILABLE:
         keyboard_rows.append([
             InlineKeyboardButton(text="📅 Календарь смен", callback_data="show_calendar")
         ])
-    
-    # Добавляем кнопку проверки списков, если модуль доступен
+
     if LISTS_PARSER_AVAILABLE:
         keyboard_rows.append([
             InlineKeyboardButton(text="📋 Проверить списки", callback_data="check_lists")
         ])
-    
-    # Добавляем кнопку квиза, если модуль доступен
+
     if QUIZ_AVAILABLE:
         keyboard_rows.append([
             InlineKeyboardButton(text="🎯 Квиз: подбор направления", callback_data="start_quiz")
         ])
-    
+
     keyboard_rows.append([
         InlineKeyboardButton(text="👨‍💼 Связаться с консультантом", callback_data="request_consultant")
     ])
-    
+
     keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
-    
     await message.answer(welcome_text, reply_markup=keyboard)
 
 @dp.message(Command("help"))
@@ -712,6 +780,92 @@ async def cmd_help(message: Message, state: FSMContext):
     else:
         await message.answer("❌ Не удалось подключиться к системе операторов. Попробуйте позже.")
 
+@dp.message(Command("menu"))
+async def cmd_menu(message: Message):
+    """Главное меню (аналог callback back_to_menu)"""
+    welcome_text = (
+        "👋 Добро пожаловать в бот Национального детского технопарка!\n\n"
+        "🤖 Я ваш интеллектуальный помощник. Выберите интересующую вас тему:"
+    )
+
+    keyboard_rows = [
+        [
+            InlineKeyboardButton(text="🏫 О технопарке", callback_data="info_about"),
+            InlineKeyboardButton(text="📚 Направления обучения", callback_data="info_programs")
+        ],
+        [
+            InlineKeyboardButton(text="📝 Поступление", callback_data="info_admission")
+        ]
+    ]
+
+    if CALENDAR_AVAILABLE:
+        keyboard_rows.append([
+            InlineKeyboardButton(text="📅 Календарь смен", callback_data="show_calendar")
+        ])
+
+    if LISTS_PARSER_AVAILABLE:
+        keyboard_rows.append([
+            InlineKeyboardButton(text="📋 Проверить списки", callback_data="check_lists")
+        ])
+
+    if QUIZ_AVAILABLE:
+        keyboard_rows.append([
+            InlineKeyboardButton(text="🎯 Квиз: подбор направления", callback_data="start_quiz")
+        ])
+
+    # Если брейншторм подключен — добавим кнопку (brainstorm_mod также добавляет свою при регистрации)
+    if BRAINSTORM_AVAILABLE:
+        keyboard_rows.insert(0, [InlineKeyboardButton(text="🧠 Брейншторм идей", callback_data="start_brainstorm")])
+
+    keyboard_rows.append([
+        InlineKeyboardButton(text="👨‍💼 Связаться с консультантом", callback_data="request_consultant")
+    ])
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
+    await message.answer(welcome_text, reply_markup=keyboard)
+
+@dp.message(Command("quiz"))
+async def cmd_quiz(message: Message, state: FSMContext):
+    """Запуск квиза (аналог callback start_quiz)"""
+    if not QUIZ_AVAILABLE:
+        await message.answer("❌ Квиз временно недоступен")
+        return
+    try:
+        # Используем реализацию из квиз-модуля для запуска из сообщений
+        await quiz_start(message, state, bot)
+    except Exception as e:
+        logger.error(f"❌ Ошибка запуска /quiz: {e}")
+        await message.answer("❌ Ошибка запуска квиза")
+
+@dp.message(Command("checklists"))
+async def cmd_checklists(message: Message, state: FSMContext):
+    """Проверка списков (аналог callback check_lists)"""
+    if not LISTS_PARSER_AVAILABLE:
+        await message.answer("❌ Проверка списков временно недоступна")
+        return
+    try:
+        await state.set_state(UserState.SEARCHING_LISTS)
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 Назад в меню", callback_data="back_to_menu")]
+        ])
+        await message.answer(
+            "🔍 Поиск в списках участников\n\n"
+            "Напишите имя фамилия для поиска:\n\n"
+            "📝 Примеры:\n"
+            "• Анна Иванова\n"
+            "• Максим Петров\n"
+            "• Елена Сидорова\n\n"
+            "💡 Правила поиска:\n"
+            "• Одно слово → найдет любые записи с этим словом\n"
+            "• Два слова → найдет только точные совпадения фразы\n"
+            "• Поддерживается обратный порядок (Имя Фамилия ↔ Фамилия Имя)\n\n"
+            "⚠️ 'Иванов Петр' НЕ найдет документы, где есть только 'Иванов' или только 'Петр'\n\n"
+            "✏️ Введите данные для поиска:",
+            reply_markup=keyboard
+        )
+    except Exception as e:
+        logger.error(f"❌ Ошибка запуска /checklists: {e}")
+        await message.answer("❌ Ошибка запуска поиска")
 @dp.message(Command("status"))
 async def cmd_status(message: Message):
     """Показать статус пользователя"""
@@ -834,6 +988,8 @@ async def cmd_end_session(message: Message):
     else:
         await message.answer("❌ У вас нет активных сессий")
 
+# Удален дублирующийся обработчик /start — логика объединена выше
+
 @dp.message(Command("operators"))
 async def cmd_operators_list(message: Message):
     """Список операторов (для администраторов)"""
@@ -869,6 +1025,137 @@ async def cmd_check_operator(message: Message):
         await message.answer(status_text)
     else:
         await message.answer(f"❌ Ваш ID ({user_id}) не найден в списке операторов")
+
+    # Новые команды и утилиты для операторов будут ниже
+
+def _build_queue_page_text_and_kb(page: int, page_size: int = 5):
+    """Сформировать текст и инлайн-клавиатуру страницы очереди"""
+    total = len(operator_handler.waiting_queue)
+    items = list(operator_handler.waiting_queue.items())
+    pages = max(1, (total + page_size - 1) // page_size)
+    page = max(1, min(page, pages))
+    start = (page - 1) * page_size
+    end = start + page_size
+    slice_items = items[start:end]
+
+    header = (
+        f"📋 Очередь запросов (стр. {page}/{pages})\n"
+        f"⏳ В ожидании: {total} | 💬 Активных: {len(operator_handler.active_sessions)} | 👨‍💼 Онлайн: {len(operator_handler.operator_manager.get_active_operators())}\n\n"
+    )
+    body = ""
+    for idx, (uid, info) in enumerate(slice_items, start=start + 1):
+        uname = f"@{info.get('username')}" if info.get('username') else "—"
+        req_time = info.get('request_time')
+        tstr = req_time.strftime('%H:%M') if hasattr(req_time, 'strftime') else "—"
+        body += (
+            f"{idx}. {info.get('first_name', 'Пользователь')} ({uname})\n"
+            f"   ⏰ {tstr}  •  ID: {uid}\n"
+        )
+    text = header + (body or "Пока пусто")
+
+    # Клавиатура: для каждого элемента - кнопка Принять, затем навигация
+    rows = []
+    for uid, _ in slice_items:
+        rows.append([
+            InlineKeyboardButton(text="✅ Принять", callback_data=f"accept_request_{uid}")
+        ])
+    # Навигация
+    nav_row = []
+    if page > 1:
+        nav_row.append(InlineKeyboardButton(text="◀️ Назад", callback_data=f"queue_page_{page-1}"))
+    if page < pages:
+        nav_row.append(InlineKeyboardButton(text="▶️ Далее", callback_data=f"queue_page_{page+1}"))
+    if nav_row:
+        rows.append(nav_row)
+    rows.append([InlineKeyboardButton(text="🔄 Обновить", callback_data="queue_status")])
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
+
+    return text, kb
+
+@dp.message(Command("queue"))
+async def cmd_queue(message: Message):
+    """Показать очередь запросов (для операторов)"""
+    if not operator_handler.operator_manager.is_operator(message.from_user.id):
+        await message.answer("❌ Доступно только операторам")
+        return
+    text, kb = _build_queue_page_text_and_kb(page=1)
+    await message.answer(text, reply_markup=kb)
+
+@dp.callback_query(F.data == "request_consultant")
+async def handle_request_consultant(callback: CallbackQuery, state: FSMContext):
+    """Обработка кнопки 'Связаться с консультантом' — тот же функционал, что и /help"""
+    try:
+        user = callback.from_user
+        chat_id = callback.message.chat.id if callback.message else user.id
+        # Эскалируем с явными атрибутами пользователя, чтобы не подставлялись данные бота
+        success = await operator_handler.escalate_to_operator(
+            user.id,
+            callback.message,
+            auto_escalation=False,
+            bot=bot,
+            first_name=user.first_name or "",
+            username=user.username or "",
+            chat_id=chat_id,
+            origin_message_id=None,
+            original_message_override="Запрос консультации"
+        )
+        if success:
+            await state.set_state(OperatorState.WAITING_OPERATOR)
+            queue_info = operator_handler.get_queue_info()
+            position = len([u for u in queue_info["queue_details"] if u["user_id"] == user.id])
+            await callback.message.answer(
+                "📞 Ваш запрос передан консультанту.\n"
+                "Пожалуйста, ожидайте подключения.\n\n"
+                f"📋 Ваша позиция в очереди: {position}\n"
+                "⏰ Среднее время ожидания: 3-5 минут\n\n"
+                "Вы можете отменить ожидание командой /cancel"
+            )
+        else:
+            await callback.message.answer("❌ Не удалось подключиться к системе операторов. Попробуйте позже.")
+    finally:
+        try:
+            await callback.answer()
+        except Exception:
+            pass
+
+@dp.callback_query(F.data.startswith("queue_page_"))
+async def handle_queue_page_callback(callback: CallbackQuery):
+    if not operator_handler.operator_manager.is_operator(callback.from_user.id):
+        await callback.answer("❌ Нет прав", show_alert=True)
+        return
+    try:
+        page = int(callback.data.split("_")[2])
+    except Exception:
+        page = 1
+    text, kb = _build_queue_page_text_and_kb(page=page)
+    await callback.message.edit_text(text)
+    await callback.message.edit_reply_markup(reply_markup=kb)
+    await callback.answer()
+
+@dp.message(Command("consultants_stats"))
+async def cmd_consultants_stats(message: Message):
+    """Агрегированная статистика по консультантам (для операторов/админов)"""
+    if not operator_handler.operator_manager.is_operator(message.from_user.id):
+        await message.answer("❌ Доступно только операторам")
+        return
+    stats = operator_handler.get_consultants_stats()
+    hist = stats["rating_histogram"]
+    lines = [
+        "📊 Общая статистика консультантов:\n",
+        f"⭐ Средний рейтинг: {stats['overall_avg_rating']}\n",
+        f"📈 Оцененных сессий: {stats['rated_sessions']} / Отчетных сессий: {stats['total_sessions_reported']}\n",
+        f"💬 Активных сессий: {stats['active_sessions']} | ⏳ В ожидании: {stats['waiting']}\n",
+        "\nРаспределение оценок:",
+        f"1⭐: {hist.get(1,0)}  |  2⭐: {hist.get(2,0)}  |  3⭐: {hist.get(3,0)}  |  4⭐: {hist.get(4,0)}  |  5⭐: {hist.get(5,0)}",
+        "\nТоп консультантов:" 
+    ]
+    # Сортируем консультантов по рейтингу и количеству сессий
+    ops = sorted(stats["operators"], key=lambda x: (x.get("rating",0), x.get("total_sessions",0)), reverse=True)
+    for op in ops:
+        lines.append(
+            f"• {op['name']} — ⭐ {op['rating']}/5 ({op['total_sessions']} сесс.), {'🟢' if op['is_active'] else '⚪️'}"
+        )
+    await message.answer("\n".join(lines))
 
 # Обработчики сообщений от операторов (ДОЛЖНЫ БЫТЬ ВЫШЕ ОСНОВНЫХ ОБРАБОТЧИКОВ!)
 @dp.message(F.text & F.from_user.id.in_(list(operator_handler.operator_manager.operators_config.keys())))
@@ -913,12 +1200,10 @@ async def handle_operator_media(message: Message):
     
     logger.info(f"📎 Получено {media_type} от оператора {operator_id}")
     
-    # Пересылаем медиа пользователю (упрощенная версия - только текст)
-    success, msg = await operator_handler.forward_operator_message(
-        operator_id, f"[{media_type}]", bot
-    )
+    # Пересылаем медиа пользователю
+    success = await operator_handler.forward_operator_media(operator_id, message, bot)
     if not success:
-        await message.answer(f"❌ Ошибка пересылки медиа: {msg}")
+        await message.answer("❌ Ошибка пересылки медиа пользователю")
     else:
         logger.info(f"✅ {media_type.capitalize()} от оператора {operator_id} переслано пользователю")
 
@@ -1005,6 +1290,11 @@ async def handle_text(message: Message, state: FSMContext):
     logger.info(f"🤖 Пользователь {user_id} (@{message.from_user.username}) спрашивает: '{message.text[:50]}{'...' if len(message.text) > 50 else ''}'")
     try:
         logger.info("🔍 Начинаем поиск в базе знаний...")
+        # Запомним последнее пользовательское сообщение для возможной быстрой эскалации
+        try:
+            operator_handler.remember_user_message(message)
+        except Exception:
+            pass
         
         # Получаем контекст из RAG системы
         context = await get_enhanced_context(message.text)
@@ -1095,6 +1385,17 @@ async def handle_text(message: Message, state: FSMContext):
                             message_id=sent_message.message_id
                         )
                     logger.info(f"✅ Стриминговый ответ завершен: {len(response_text)} символов для пользователя {user_id}")
+                    # Если ответ содержит предложение обратиться к оператору — покажем кнопку для быстрого вызова
+                    try:
+                        lower_text = response_text.lower()
+                        if ("/help" in lower_text) or ("обратит" in lower_text and "оператор" in lower_text):
+                            from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+                            help_kb = InlineKeyboardMarkup(inline_keyboard=[
+                                [InlineKeyboardButton(text="Связаться с консультантом", callback_data="escalate_from_last")]
+                            ])
+                            await message.answer("Нужна помощь консультанта? Нажмите кнопку:", reply_markup=help_kb)
+                    except Exception as kb_error:
+                        logger.debug(f"Не удалось показать кнопку эскалации: {kb_error}")
                 except Exception as final_edit_error:
                     logger.error(f"Ошибка финального обновления: {final_edit_error}")
                     # Если не можем отредактировать, отправляем новое сообщение
@@ -1506,6 +1807,21 @@ async def cmd_calendar(message: Message):
     except Exception as e:
         logger.error(f"❌ Ошибка команды /calendar: {e}")
         await message.answer("❌ Ошибка загрузки календаря")
+
+@dp.callback_query(F.data == "show_calendar")
+async def handle_show_calendar(callback: CallbackQuery):
+    """Показ календаря смен из главного меню (инлайн кнопка)"""
+    if not CALENDAR_AVAILABLE:
+        await callback.answer("❌ Календарь смен временно недоступен", show_alert=True)
+        return
+    try:
+        user_id = callback.from_user.id
+        text, keyboard = get_calendar_interface(user_id)
+        await callback.message.edit_text(text, reply_markup=keyboard)
+        await callback.answer()
+    except Exception as e:
+        logger.error(f"❌ Ошибка показа календаря по callback: {e}")
+        await callback.answer("❌ Ошибка загрузки календаря", show_alert=True)
 
 @dp.message(Command("notifications"))
 async def cmd_notifications(message: Message):
@@ -1974,74 +2290,82 @@ async def handle_accept_request_callback(callback: CallbackQuery):
         logger.error(f"❌ Неожиданная ошибка в accept_request_callback: {e}", exc_info=True)
         await callback.answer(f"❌ Ошибка: {e}", show_alert=True)
 
+@dp.callback_query(F.data == "escalate_from_last")
+async def handle_escalate_from_last(callback: CallbackQuery):
+    """Быстрый вызов консультанта по последнему сообщению"""
+    user_id = callback.from_user.id
+    try:
+        success = await operator_handler.escalate_from_last(user_id, bot)
+        if success:
+            await callback.message.answer(
+                "📞 Ваш запрос передан консультанту. Пожалуйста, ожидайте подключения.\n\n"
+                "Вы можете отменить ожидание командой /cancel"
+            )
+            await callback.answer("Запрос передан консультанту")
+        else:
+            await callback.answer("Сейчас нельзя вызвать консультанта", show_alert=True)
+    except Exception as e:
+        logger.error(f"Ошибка эскалации из кнопки: {e}")
+        await callback.answer("Произошла ошибка. Попробуйте позже.", show_alert=True)
+
+@dp.callback_query(F.data == "rate_skip")
+async def handle_rate_skip(callback: CallbackQuery):
+    """Пользователь пропускает оценку"""
+    user_id = callback.from_user.id
+    try:
+        ok = await operator_handler.skip_rating(user_id, bot)
+        if ok:
+            try:
+                await callback.message.edit_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            await callback.answer("Спасибо!", show_alert=False)
+        else:
+            await callback.answer("Оценка сейчас недоступна", show_alert=True)
+    except Exception as e:
+        logger.error(f"Ошибка при пропуске оценки: {e}")
+        await callback.answer("Ошибка. Попробуйте позже.", show_alert=True)
+
+@dp.callback_query(F.data.startswith("rate_"))
+async def handle_rate_callback(callback: CallbackQuery):
+    """Обработка оценки качества от пользователя"""
+    data = callback.data
+    user_id = callback.from_user.id
+    try:
+        if data == "rate_skip":
+            # Обрабатывается отдельным хэндлером
+            await callback.answer()
+            return
+        parts = data.split("_")
+        if len(parts) != 3:
+            await callback.answer("Некорректные данные оценки", show_alert=True)
+            return
+        _, rating_str, operator_id_str = parts
+        if rating_str not in {"1","2","3","4","5"}:
+            await callback.answer("Некорректная оценка", show_alert=True)
+            return
+        rating = int(rating_str)
+        operator_id = int(operator_id_str)
+        ok = await operator_handler.rate_operator(user_id, operator_id, rating, bot)
+        if ok:
+            try:
+                await callback.message.edit_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            await callback.answer("Спасибо за оценку!", show_alert=False)
+        else:
+            await callback.answer("Сейчас оценка недоступна", show_alert=True)
+    except Exception as e:
+        logger.error(f"Ошибка обработки оценки: {e}")
+        await callback.answer("Ошибка при обработке оценки", show_alert=True)
+
 @dp.callback_query(F.data.startswith("request_details_"))
 async def handle_request_details_callback(callback: CallbackQuery):
-    """Показать подробную информацию о запросе"""
+    """Детали отключены: обработчик сохраняем для совместимости, но не используем."""
     try:
-        user_id = int(callback.data.split("_")[2])
-        operator_id = callback.from_user.id
-        
-        if not operator_handler.operator_manager.is_operator(operator_id):
-            await callback.answer("❌ У вас нет прав оператора", show_alert=True)
-            return
-        
-        # Получаем детальную информацию о запросе
-        if user_id in operator_handler.waiting_queue:
-            request_info = operator_handler.waiting_queue[user_id]
-            message_history = request_info.get('message_history', [])
-            
-            details_text = (
-                f"📋 **Детали запроса**\n\n"
-                f"👤 **Пользователь:** {request_info['first_name']}\n"
-                f"📱 **Username:** @{request_info['username']}\n"
-                f"⏰ **Время запроса:** {request_info['request_time'].strftime('%H:%M:%S')}\n"
-                f"📋 **Позиция в очереди:** {request_info['queue_position']}\n\n"
-                f"💬 **Оригинальный запрос:**\n_{request_info['original_message']}_\n\n"
-            )
-            
-            if message_history:
-                details_text += "📜 **История сообщений:**\n"
-                for i, msg in enumerate(message_history, 1):
-                    timestamp = msg.get('timestamp', 'неизвестно')
-                    if isinstance(timestamp, datetime):
-                        timestamp = timestamp.strftime('%H:%M')
-                    text = msg.get('text', '[медиа]')
-                    details_text += f"{i}. [{timestamp}] {text}\n"
-            
-            # Создаем кнопки для действий
-            keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="✅ Принять запрос", 
-                        callback_data=f"accept_request_{user_id}"
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        text="🔙 Назад к уведомлению", 
-                        callback_data=f"refresh_request_{user_id}"
-                    )
-                ]
-            ])
-            
-            await callback.message.edit_text(
-                details_text,
-                reply_markup=keyboard,
-                parse_mode="Markdown"
-            )
-        else:
-            await callback.message.edit_text(
-                "❌ **Запрос не найден**\n\nВозможно, запрос уже был обработан другим оператором.",
-                reply_markup=None,
-                parse_mode="Markdown"
-            )
-        
-        await callback.answer()
-        
-    except (ValueError, IndexError):
-        await callback.answer("❌ Некорректный ID пользователя", show_alert=True)
-    except Exception as e:
-        await callback.answer(f"❌ Ошибка: {e}", show_alert=True)
+        await callback.answer("Кнопка 'Детали' больше не используется", show_alert=True)
+    except Exception:
+        pass
 
 @dp.callback_query(F.data == "queue_status")
 async def handle_queue_status_callback(callback: CallbackQuery):
@@ -2168,21 +2492,17 @@ async def handle_info_about(callback: CallbackQuery):
     ])
     
     info_text = (
-        "🏫 **О Национальном детском технопарке**\n\n"
-        "Национальный детский технопарк - это современное образовательное учреждение, "
-        "где дети и подростки могут изучать передовые технологии и развивать инновационные навыки.\n\n"
-        "🎯 **Наша миссия:**\n"
-        "• Развитие технического творчества у детей\n"
-        "• Подготовка будущих инженеров и изобретателей\n"
-        "• Популяризация науки и технологий\n\n"
-        "🏢 **Современная инфраструктура:**\n"
-        "• Высокотехнологичные лаборатории\n"
-        "• Современное оборудование\n"
-        "• Опытные преподаватели\n\n"
-        "📞 Для получения подробной информации свяжитесь с консультантом."
+        "🎯 **Национальный детский технопарк (НДТ)**\n"
+        "— учреждение дополнительного образования для одаренных учащихся 9–11 классов, созданное с целью развития интереса к науке, технике и инновациям.\n\n"
+        "🚀 **Наша миссия:**\n"
+        "Отслеживать образовательные тренды, определять приоритеты и помогать талантливым школьникам реализовать свой научно-технический потенциал, вдохновлять на открытия.\n\n"
+        "📚 **Что такое образовательная смена?**\n"
+        "Это бесплатное обучение в течение 24 дней, включающее обучение по выбранному направлению, школьные уроки и насыщенную внеучебную программу: экскурсии, занятия в бассейне, хореография и друго\n\n"
+        "🔄 **Продолжение после смены:**\n"
+        "Успешные участники могут продолжить проект дистанционно и получить рекомендации от Наблюдательного совета — для поступления в лицеи и вузы без вступительных испытаний."
     )
     
-    await callback.message.edit_text(info_text, reply_markup=keyboard)
+    await callback.message.edit_text(info_text, reply_markup=keyboard, parse_mode="Markdown")
     await callback.answer()
 
 @dp.callback_query(F.data == "info_programs")
@@ -2193,27 +2513,29 @@ async def handle_info_programs(callback: CallbackQuery):
     ])
     
     info_text = (
-        "📚 **Направления обучения в технопарке**\n\n"
-        "🤖 **Робототехника**\n"
-        "• Конструирование роботов\n"
-        "• Программирование микроконтроллеров\n"
-        "• Участие в соревнованиях\n\n"
-        "💻 **Программирование**\n"
-        "• Изучение различных языков программирования\n"
-        "• Разработка мобильных приложений\n"
-        "• Создание веб-сайтов\n\n"
-        "🔬 **Инженерные технологии**\n"
-        "• 3D-моделирование и печать\n"
-        "• Лазерные технологии\n"
-        "• Прототипирование\n\n"
-        "🧬 **Биотехнологии**\n"
-        "• Лабораторные исследования\n"
-        "• Современные методы анализа\n"
-        "• Практические работы\n\n"
-        "📞 Для получения подробной информации о направлениях свяжитесь с консультантом."
+        "📖 **Образовательные направления (15 наименований):**\n"
+        "Занятия длятся 72 часа (6 раз в неделю по 4 ч) в группах 7–10 человек.\n\n"
+        "Список актуальных направлений (с ноября 2022 г.):\n"
+        "- Авиакосмические технологии\n"
+        "- Архитектура и дизайн\n"
+        "- Биотехнологии\n"
+        "- Виртуальная и дополненная реальность\n"
+        "- Зелёная химия\n"
+        "- Инженерная экология\n"
+        "- Информационная безопасность\n"
+        "- Информационные и компьютерные технологии\n"
+        "- Лазерные технологии\n"
+        "- Машины и двигатели, автомобилестроение\n"
+        "- Наноиндустрия и нанотехнологии\n"
+        "- Природные ресурсы\n"
+        "- Робототехника\n"
+        "- Электроника и связь\n"
+        "- Энергетика будущего\n\n"
+        "🛠 **Что происходит на смене:**\n"
+        "Учащиеся осваивают теорию и защищают исследовательский проект — некоторые из них затем развиваются дальше онлайн и участвуют в конкурсах и конференциях "
     )
     
-    await callback.message.edit_text(info_text, reply_markup=keyboard)
+    await callback.message.edit_text(info_text, reply_markup=keyboard, parse_mode="Markdown")
     await callback.answer()
 
 @dp.callback_query(F.data == "info_admission")
@@ -2224,26 +2546,43 @@ async def handle_info_admission(callback: CallbackQuery):
     ])
     
     info_text = (
-        "📝 **Поступление в технопарк**\n\n"
-        "🎯 **Кого мы принимаем:**\n"
-        "• Детей от 5 до 18 лет\n"
-        "• Заинтересованных в изучении технологий\n"
-        "• Готовых к активному обучению\n\n"
-        "📋 **Процедура поступления:**\n"
-        "1️⃣ Подача заявки через сайт или лично\n"
-        "2️⃣ Предоставление необходимых документов\n"
-        "3️⃣ Собеседование (при необходимости)\n"
-        "4️⃣ Зачисление на выбранное направление\n\n"
-        "📄 **Необходимые документы:**\n"
-        "• Заявление от родителей/законных представителей\n"
-        "• Копия свидетельства о рождении/паспорта\n"
-        "• Медицинская справка (при необходимости)\n\n"
-        "⏰ **Сроки подачи заявок:**\n"
-        "Прием заявок ведется круглогодично в зависимости от направления и наличия мест.\n\n"
-        "📞 Для получения подробной информации о поступлении свяжитесь с консультантом."
+        "📥 **Как попасть в Национальный детский технопарк**\n"
+        "Отбор проходит в 2 этапа: заочный (онлайн) и очный (в областных учреждениях образования).\n\n"
+        "━━━━━━━━━━━━━━\n"
+        "🔹 **Этап 1. Заочный (дистанционный)**\n"
+        "1. Заполнить онлайн-заявку.\n"
+        "2. Прикрепить исследовательский проект и/или диплом победителя или участника международных, республиканских, областных образовательных мероприятий.\n\n"
+        "**Критерии оценки проекта (макс. 30 баллов):**\n"
+        "- 📌 Соответствие образовательному направлению — 0–2 б.\n"
+        "- 📌 Актуальность проблемы — до 6 б. (значимость идеи — 0–3, научная новизна — 0–3).\n"
+        "- 📌 Теоретическая и практическая ценность — до 6 б.\n"
+        "- 📌 Качество содержания — до 8 б. (выводы, оригинальность, наличие исследовательского аспекта, перспективы развития).\n"
+        "- 📌 Оформление — до 8 б. (структура, титульный лист, оглавление, источники, рисунки и таблицы).\n\n"
+        "⚠ Если проект не соответствует выбранному направлению, дальнейшая оценка не проводится.\n\n"
+        "━━━━━━━━━━━━━━\n"
+        "🔹 **Этап 2. Очный**\n"
+        "Проводится в областных учреждениях образования и включает:\n"
+        "1. **Тест** (по программе до 9 класса):\n"
+        "   - Общая физика  \n"
+        "   - Математика  \n"
+        "   - Логика  \n"
+        "   - Пространственное мышление  \n"
+        "   - Естественные науки  \n"
+        "   **Структура теста:**\n"
+        "     - Блок А — 30 вопросов × 1 балл.\n"
+        "     - Блок Б — 10 вопросов × 2 балла.\n"
+        "   На каждую смену готовится новый тест. Достаточно хорошо учиться в школе и иметь широкий кругозор.\n\n"
+        "2. **Собеседование**  \n"
+        "   Цель — выявить мотивацию и понимание выбранного направления.  \n"
+        "   Возможные вопросы:\n"
+        "   - Проект или диплом, представленный на 1 этапе.\n"
+        "   - Суть проекта и ход работы над ним.\n"
+        "   - Причины выбора направления.\n\n"
+        "━━━━━━━━━━━━━━\n"
+        "📜 **Результат**: по итогам 2 этапов приёмная комиссия принимает решение о зачислении или отказе в участии в образовательной смене."
     )
     
-    await callback.message.edit_text(info_text, reply_markup=keyboard)
+    await callback.message.edit_text(info_text, reply_markup=keyboard, parse_mode="Markdown")
     await callback.answer()
 
 # Обработчики для расписания, контактов и стоимости удалены
