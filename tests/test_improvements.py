@@ -236,7 +236,7 @@ def test_rate_limits():
             print(f"  {status} Запрос {i+1}: {used}/{limit}")
             
             if not allowed:
-                print(f"  ⌛ Лимит исчерпан")
+                print("  ⌛ Лимит исчерпан")
                 break
     
     print("\n💡 Возможности:")
@@ -265,7 +265,7 @@ async def test_semaphore():
     tasks = [mock_llm_request(i) for i in range(1, 6)]
     results = await asyncio.gather(*tasks, return_exceptions=True)
     
-    print(f"\n📊 Результаты:")
+    print("\n📊 Результаты:")
     for i, result in enumerate(results, 1):
         if isinstance(result, Exception):
             print(f"  ❌ Запрос {i}: {result}")

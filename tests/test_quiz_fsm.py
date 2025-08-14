@@ -3,7 +3,7 @@
 Быстрый тест для проверки FSM состояний квиза
 """
 import asyncio
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 async def test_quiz_states():
     """Тестирует состояния квиза"""

@@ -1,17 +1,12 @@
-import os
 import json
 import hashlib
 import logging
 import time
-import re
-from typing import Dict, List, Any, Optional, Tuple, Set
+from typing import Dict, List, Any, Optional
 from datetime import datetime, timedelta
 from pathlib import Path
 from dataclasses import dataclass, field
-from collections import defaultdict, Counter
-from difflib import SequenceMatcher
-import pickle
-import asyncio
+from collections import Counter
 
 try:
     import chromadb
@@ -531,7 +526,7 @@ class TokenOptimizedRAG:
         if directions:
             # Показываем первые 10 направлений
             top_directions = directions[:10]
-            return f"🎓 Образовательные направления:\n" + "\n".join(f"• {d}" for d in top_directions)
+            return "🎓 Образовательные направления:\n" + "\n".join(f"• {d}" for d in top_directions)
         
         # Fallback
         return "🎓 15 современных направлений: ИТ, робототехника, биотехнологии, мехатроника и др."

@@ -3,7 +3,6 @@
 Продвинутый тест для проверки новой логики квиза
 """
 import asyncio
-import os
 from dotenv import load_dotenv
 
 # Загрузка переменных окружения

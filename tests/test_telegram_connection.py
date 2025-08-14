@@ -24,7 +24,7 @@ async def test_telegram_connection():
         
         # Проверяем подключение
         me = await bot.get_me()
-        print(f"✅ Успешное подключение к Telegram API")
+        print("✅ Успешное подключение к Telegram API")
         print(f"🤖 Имя бота: {me.first_name}")
         print(f"🆔 ID бота: {me.id}")
         print(f"👤 Username: @{me.username}")

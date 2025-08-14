@@ -1,6 +1,6 @@
 import json
 import logging
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 import re
 from difflib import SequenceMatcher
 
@@ -273,7 +273,7 @@ class RAGSystem:
         
         contacts = info.get('contacts', {})
         if contacts:
-            text += f"Контакты:\n"
+            text += "Контакты:\n"
             text += f"  Телефон: {contacts.get('phone', '')}\n"
             text += f"  Email: {contacts.get('email', '')}\n"
             text += f"  Адрес: {contacts.get('address', '')}\n"

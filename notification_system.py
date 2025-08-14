@@ -2,7 +2,7 @@ import json
 import logging
 import asyncio
 from datetime import datetime, date, timedelta
-from typing import Dict, List, Set, Optional
+from typing import Dict, List, Optional
 from aiogram import Bot
 
 logger = logging.getLogger(__name__)

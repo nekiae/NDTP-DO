@@ -3,7 +3,6 @@
 Тестовый файл для проверки квиз модуля
 """
 import asyncio
-import os
 from dotenv import load_dotenv
 
 # Загрузка переменных окружения

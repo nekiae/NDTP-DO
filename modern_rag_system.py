@@ -1,4 +1,3 @@
-import os
 import json
 import uuid
 import asyncio
@@ -8,7 +7,6 @@ from datetime import datetime
 from typing import Dict, List, Any
 
 import chromadb
-import numpy as np
 from sentence_transformers import SentenceTransformer
 
 # Настройка логирования

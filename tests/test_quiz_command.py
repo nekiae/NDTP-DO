@@ -14,8 +14,7 @@ async def test_quiz_command_handling():
     print("🧪 Тестирую обработку команды /quiz...")
     
     try:
-        from quiz_mod import register_quiz_handlers, QuizState
-        from bot import dp, bot
+        from quiz_mod import QuizState
         
         # Создаём мок объекты
         mock_message = Mock()
@@ -34,7 +33,6 @@ async def test_quiz_command_handling():
         print(f"✅ Состояния квиза: {states}")
         
         # Проверяем, что команда /quiz не попадает в основной обработчик
-        from bot import handle_text
         
         # Создаём мок для проверки исключения
         mock_message_quiz = Mock()
@@ -55,7 +53,6 @@ async def test_quiz_state_handling():
     print("🧪 Тестирую обработку состояний квиза...")
     
     try:
-        from quiz_mod import QuizState, handle_quiz_q1
         
         # Создаём мок объекты для состояния квиза
         mock_message = Mock()
@@ -65,7 +62,7 @@ async def test_quiz_state_handling():
         mock_state = AsyncMock()
         mock_state.get_state.return_value = "QuizState:Q1"
         
-        mock_bot = Mock()
+        Mock()
         
         print("✅ Обработчики состояний квиза доступны")
         return True

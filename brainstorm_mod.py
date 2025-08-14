@@ -1,8 +1,6 @@
-import asyncio
 import logging
-import json
 from datetime import datetime
-from typing import Optional, Dict, List
+from typing import Dict, List
 from aiogram import Router, F
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext

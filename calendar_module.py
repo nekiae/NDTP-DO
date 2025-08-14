@@ -1,6 +1,5 @@
 import json
 import logging
-import asyncio
 from datetime import datetime
 from typing import List, Dict, Optional
 import aiohttp
@@ -396,13 +395,13 @@ def get_notification_settings_interface(user_id: int) -> tuple[str, InlineKeyboa
         [
             InlineKeyboardButton(
                 text=f"{schedule_emoji} Обновления расписания",
-                callback_data=f"toggle_notification_schedule_updates"
+                callback_data="toggle_notification_schedule_updates"
             )
         ],
         [
             InlineKeyboardButton(
                 text=f"{reminders_emoji} Напоминания о дедлайнах", 
-                callback_data=f"toggle_notification_application_reminders"
+                callback_data="toggle_notification_application_reminders"
             )
         ],
         [

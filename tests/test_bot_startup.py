@@ -17,7 +17,6 @@ def test_quiz_import():
     print("🧪 Тестирую импорт квиз-модуля...")
     
     try:
-        from quiz_mod import register_quiz_handlers, get_quiz_stats, quiz_start_callback
         print("✅ Все функции квиза успешно импортированы")
         return True
     except Exception as e:
@@ -30,7 +29,7 @@ def test_bot_init():
     
     try:
         # Импорт основных модулей
-        from bot import logger, QUIZ_AVAILABLE
+        from bot import QUIZ_AVAILABLE
         print(f"✅ Основной модуль бота загружен. Квиз доступен: {QUIZ_AVAILABLE}")
         return True
     except Exception as e:

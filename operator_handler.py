@@ -1,10 +1,8 @@
 import logging
-import json
 from typing import Optional, Dict, List, Tuple
-from datetime import datetime, timedelta
+from datetime import datetime
 from enum import Enum
 from aiogram import types, Bot
-from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
@@ -327,12 +325,10 @@ class OperatorHandler:
         
         # Найти активную сессию для оператора
         user_session = None
-        target_user_id = None
         
         for user_id, session in self.active_sessions.items():
             if session["operator_id"] == operator_id:
                 user_session = session
-                target_user_id = user_id
                 break
         
         if not user_session:
@@ -455,7 +451,7 @@ class OperatorHandler:
         if user_id not in self.waiting_queue:
             return False, "Вы не находитесь в очереди ожидания"
         
-        request_info = self.waiting_queue.pop(user_id)
+        self.waiting_queue.pop(user_id)
         self.set_user_status(user_id, UserStatus.NORMAL)
         
         # Перенумеровываем очередь

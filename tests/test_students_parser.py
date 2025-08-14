@@ -212,7 +212,7 @@ async def demo_usage():
         
         # Показываем первые несколько учащихся
         context = parser.get_students_context()
-        print(f"\n📋 Первые записи:")
+        print("\n📋 Первые записи:")
         lines = context.split('\n')[:15]  # Показываем первые 15 строк
         for line in lines:
             print(line)

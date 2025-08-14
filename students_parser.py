@@ -2,8 +2,8 @@ import aiohttp
 import logging
 import json
 import asyncio
-from datetime import datetime, timedelta
-from typing import Dict, Optional, List
+from datetime import datetime
+from typing import Dict, Optional
 from bs4 import BeautifulSoup
 import os
 import re
@@ -533,7 +533,7 @@ class StudentsParser:
                 return "📋 Список учащихся пуст или недоступен."
             
             # Формируем ответ
-            response = f"📋 **Список учащихся НДТП**\n\n"
+            response = "📋 **Список учащихся НДТП**\n\n"
             response += f"Всего учащихся: {total_count}\n"
             response += f"Последнее обновление: {last_updated}\n\n"
             

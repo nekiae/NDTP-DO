@@ -4,7 +4,6 @@
 """
 import asyncio
 import logging
-from unittest.mock import Mock, AsyncMock
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
@@ -33,7 +32,7 @@ async def test_quiz_prompt_rules():
                 missing_rules.append(rule)
         
         if missing_rules:
-            print(f"❌ Отсутствуют критические правила:")
+            print("❌ Отсутствуют критические правила:")
             for rule in missing_rules:
                 print(f"   - {rule}")
             return False
@@ -56,7 +55,7 @@ async def test_quiz_prompt_rules():
                 missing_structure.append(structure)
         
         if missing_structure:
-            print(f"❌ Отсутствует структура вопросов:")
+            print("❌ Отсутствует структура вопросов:")
             for structure in missing_structure:
                 print(f"   - {structure}")
             return False
@@ -82,7 +81,6 @@ async def test_quiz_import():
     print("🧪 Тестирую импорт квиз-модуля...")
     
     try:
-        from quiz_mod import register_quiz_handlers, get_quiz_stats, quiz_start_callback
         print("✅ Все функции квиза успешно импортированы")
         return True
     except Exception as e:

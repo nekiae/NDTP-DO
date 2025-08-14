@@ -5,7 +5,6 @@ import asyncio
 from datetime import datetime, timedelta
 from typing import Dict, Optional, List
 from bs4 import BeautifulSoup
-import os
 
 logger = logging.getLogger(__name__)
 
@@ -319,7 +318,7 @@ class DocumentsParser:
             
             # Формируем контекст
             context_parts = [
-                f"📄 НЕОБХОДИМЫЕ ДОКУМЕНТЫ ДЛЯ ПОСТУПЛЕНИЯ В НАЦИОНАЛЬНЫЙ ДЕТСКИЙ ТЕХНОПАРК",
+                "📄 НЕОБХОДИМЫЕ ДОКУМЕНТЫ ДЛЯ ПОСТУПЛЕНИЯ В НАЦИОНАЛЬНЫЙ ДЕТСКИЙ ТЕХНОПАРК",
                 f"Источник: {self.url}",
                 f"Обновлено: {cache_data['last_updated'][:16]}",
                 ""

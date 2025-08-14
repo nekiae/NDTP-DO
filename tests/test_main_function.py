@@ -3,7 +3,6 @@
 Тест функции main() из bot.py
 """
 import asyncio
-import sys
 import traceback
 
 async def test_main_function():
@@ -30,7 +29,7 @@ async def test_main_function():
         
         # Проверяем создание диспетчера
         print("🔧 Проверка создания диспетчера...")
-        test_dp = bot.Dispatcher(storage=bot.storage)
+        bot.Dispatcher(storage=bot.storage)
         print("✅ Диспетчер создан")
         
         # Тестируем инициализацию RAG систем

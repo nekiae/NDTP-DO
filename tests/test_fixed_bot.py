@@ -4,7 +4,6 @@
 """
 import os
 import asyncio
-import time
 from dotenv import load_dotenv
 from aiogram import Bot
 
@@ -25,7 +24,7 @@ async def test_fixed_bot():
         
         # Проверяем подключение
         me = await bot.get_me()
-        print(f"✅ Подключение к Telegram: OK")
+        print("✅ Подключение к Telegram: OK")
         print(f"🤖 Бот: {me.first_name} (@{me.username})")
         
         await bot.session.close()

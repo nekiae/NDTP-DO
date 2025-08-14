@@ -3,7 +3,6 @@ from datetime import datetime
 import logging
 import json
 import asyncio
-import tempfile
 import re
 from bs4 import BeautifulSoup
 import requests
@@ -305,7 +304,7 @@ class ListsParser:
                         if not force_reload and doc_url in self.pdf_cache[shift_name]:
                             cached_doc = self.pdf_cache[shift_name][doc_url]
                             if current_time - cached_doc['timestamp'] < PDF_CACHE_EXPIRY:
-                                logger.info(f"📚 Используем кэшированную версию")
+                                logger.info("📚 Используем кэшированную версию")
                                 continue
                         
                         is_student_list = doc_type == 'student_list'

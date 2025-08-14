@@ -28,7 +28,7 @@ def test_title_shortening():
         print(f"\n{i}. ИСХОДНОЕ:")
         print(f"   '{title}'")
         print(f"   📏 Длина: {len(title)} символов")
-        print(f"   СОКРАЩЕННОЕ:")
+        print("   СОКРАЩЕННОЕ:")
         print(f"   '{shortened}'")
         print(f"   📏 Длина: {len(shortened)} символов")
         print(f"   {'✅ Сокращено' if len(shortened) < len(title) else '⚪ Без изменений'}")

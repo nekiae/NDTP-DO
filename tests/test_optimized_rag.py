@@ -142,7 +142,7 @@ def demo_cache_efficiency():
     
     for i, query in enumerate(queries, 1):
         start_time = time.time()
-        context = get_optimized_context(query, RAGModes.ECONOMY)
+        get_optimized_context(query, RAGModes.ECONOMY)
         processing_time = time.time() - start_time
         
         cache_indicator = "⚡ КЭШ" if processing_time < 0.01 else "🔄 ОБРАБОТКА"

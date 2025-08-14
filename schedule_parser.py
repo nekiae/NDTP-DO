@@ -2,8 +2,7 @@ import asyncio
 import json
 import logging
 import re
-import time
-from datetime import datetime, timedelta, date
+from datetime import datetime
 from typing import List, Dict, Optional, Tuple
 import aiohttp
 from bs4 import BeautifulSoup
@@ -357,7 +356,7 @@ class ScheduleParser:
             
             # Обычный запрос - показываем все смены
             info_parts = [
-                f"📅 РАСПИСАНИЕ ОБРАЗОВАТЕЛЬНЫХ СМЕН НА 2025 ГОД",
+                "📅 РАСПИСАНИЕ ОБРАЗОВАТЕЛЬНЫХ СМЕН НА 2025 ГОД",
                 f"Обновлено: {data['last_updated']}",
                 f"Сегодня: {datetime.now().strftime('%d.%m.%Y (%A)')}",
                 ""
