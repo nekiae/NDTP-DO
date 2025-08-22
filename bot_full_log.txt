@@ -1,2 +1,0 @@
-WARNING:root:⚠️ Ошибка импорта aioredis (возможно несовместимость с Python 3.13.3 (main, Apr  8 2025, 13:54:08) [Clang 17.0.0 (clang-1700.0.13.3)]): duplicate base class TimeoutError
-WARNING:aiogram.dispatcher:Received SIGTERM signal
