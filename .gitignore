@@ -49,5 +49,4 @@ Thumbs.db
 pip-wheel-metadata/
 
 # Local data/temp
-data/
 tmp/
