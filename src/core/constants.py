@@ -113,6 +113,7 @@ class UserStatus:
     WAITING_OPERATOR = "waiting_operator"
     WITH_OPERATOR = "with_operator"
     RATING_OPERATOR = "rating_operator"
+    SEARCHING_LISTS = "searching_list"
 
 
 # === РЕЖИМЫ RAG ===

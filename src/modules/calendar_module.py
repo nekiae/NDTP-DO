@@ -6,7 +6,10 @@ import aiohttp
 from bs4 import BeautifulSoup
 import re
 
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from ..core.config import config
+
+from aiogram import F
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 
 logger = logging.getLogger(__name__)
 
@@ -14,7 +17,7 @@ class CalendarModule:
     """Модуль календаря смен с документами"""
     
     def __init__(self):
-        self.shifts_file = "current_shifts.json"
+        self.shifts_file = config.data_dir/"parsers"/"current_shifts.json"
         self.base_url = "https://ndtp.by"
         self.schedule_url = "https://ndtp.by/educational-shifts/schedule/"
         
@@ -354,7 +357,58 @@ class CalendarModule:
 
 # Глобальный экземпляр модуля
 calendar_module = CalendarModule()
-
+def register_calendar_hadler(dp):
+    
+    @dp.callback_query(F.data == "back_to_calendar")
+    @dp.callback_query(F.data == "show_calendar")
+    async def handle_show_calendar(callback: CallbackQuery):
+        """Показать календарь смен"""
+        if not config.enable_calendar:
+            await callback.answer("❌ Календарь смен временно недоступен", show_alert=True)
+            return
+        
+        try:
+            user_id = callback.from_user.id
+            text, keyboard = get_calendar_interface(user_id)
+            await callback.message.edit_text(text, reply_markup=keyboard)
+            await callback.answer()
+        except Exception as e:
+            logger.error(f"❌ Ошибка показа календаря: {e}")
+            await callback.answer("❌ Ошибка загрузки календаря", show_alert=True)
+    @dp.callback_query(F.data.startswith("calendar_shift_"))
+    async def handle_calendar_shift(callback: CallbackQuery):
+        """Показать информацию о конкретной смене"""
+        if not config.enable_calendar:
+            await callback.answer("❌ Календарь временно недоступен", show_alert=True)
+            return
+        
+        try:
+            month_number = int(callback.data.split("_")[2])
+            text, keyboard = await get_shift_info(month_number)
+            await callback.message.edit_text(text, reply_markup=keyboard)
+            await callback.answer()
+        except (ValueError, IndexError) as e:
+            logger.error(f"❌ Ошибка парсинга данных смены: {e}")
+            await callback.answer("❌ Ошибка обработки запроса", show_alert=True)
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения информации о смене: {e}")
+            await callback.answer("❌ Ошибка загрузки информации", show_alert=True)
+    
+    @dp.callback_query(F.data == "notification_settings")
+    async def handle_notification_settings(callback: CallbackQuery):
+        """Показать настройки уведомлений"""
+        if not config.enable_calendar:
+            await callback.answer("❌ Система уведомлений временно недоступна", show_alert=True)
+            return
+        
+        try:
+            user_id = callback.from_user.id
+            text, keyboard = get_notification_settings_interface(user_id)
+            await callback.message.edit_text(text, reply_markup=keyboard)
+            await callback.answer()
+        except Exception as e:
+            logger.error(f"❌ Ошибка показа настроек уведомлений: {e}")
+            await callback.answer("❌ Ошибка загрузки настроек", show_alert=True)
 # Функции для интеграции с ботом
 def get_calendar_interface(user_id: int = None):
     """Возвращает интерфейс календаря"""
@@ -370,7 +424,7 @@ async def get_shift_documents_async(month_number: int):
 
 def get_notification_settings_interface(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     """Создает интерфейс настройки уведомлений"""
-    from notification_system import notification_system
+    from src.handlers.notification_system import notification_system
     
     # Получаем текущие подписки пользователя
     subscriptions = notification_system.get_user_subscriptions(user_id)

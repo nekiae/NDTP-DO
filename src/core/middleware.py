@@ -47,7 +47,12 @@ class HourlyLimitMiddleware(BaseMiddleware):
         data: Dict[str, Any],
     ) -> Any:
         """Обработка middleware"""
+        
+        if hasattr(event, "text") and event.text:
+            if len(event.text) < 10 and event.text.startswith("/"):
+                return await handler(event, data)
         if not hasattr(event, "from_user") or not event.from_user:
+            
             return await handler(event, data)
 
         user_id = event.from_user.id
@@ -97,7 +102,8 @@ class HourlyLimitMiddleware(BaseMiddleware):
             logger.warning(
                 f"⚠️ Пользователь {user_id} близок к лимиту: {used}/{self.limit}"
             )
-
+        
+        
         return await handler(event, data)
 
     async def _handle_with_local_cache(
@@ -128,7 +134,7 @@ class HourlyLimitMiddleware(BaseMiddleware):
                 "⌛ Вы исчерпали лимит запросов в час.\nПопробуйте через час."
             )
             return
-
+        
         return await handler(event, data)
 
 
@@ -145,7 +151,12 @@ class LoggingMiddleware(BaseMiddleware):
         if hasattr(event, "from_user") and event.from_user:
             user_id = event.from_user.id
             username = event.from_user.username or "без username"
-            
+            fsm = data.get("state")
+
+            if fsm is not None:
+                # пример: получить текущее состояние
+                state = await fsm.get_state()
+                print(f"Текущее состояние: {state}")
             # Обрезаем длинные сообщения для логов
             message_text = ""
             if hasattr(event, "text") and event.text:

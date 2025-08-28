@@ -7,20 +7,20 @@ import time
 
 from aiogram import Bot, F
 from aiogram.fsm.context import FSMContext
-from aiogram.types import Message
+from aiogram.types import Message,InlineKeyboardButton, InlineKeyboardMarkup
 
+from src.services.parsers.lists_parser import search_name_in_lists
+from src.utils.helpers import shorten_document_name
 from ..core.config import config
 from ..core.constants import get_system_prompt
-from ..handlers.operator_handler import operator_handler, UserStatus
+from ..handlers.operator_handler import operator_handler
+from src.core.constants import UserStatus
 from ..services.deepseek_client import deepseek_client
 from ..services.context_service import get_enhanced_context
 
 logger = logging.getLogger(__name__)
 
 
-class UserState:
-    """Состояния пользователя для FSM"""
-    SEARCHING_LISTS = "searching_lists"
 
 
 async def handle_text_message(message: Message, state: FSMContext, bot: Bot) -> None:
@@ -47,7 +47,7 @@ async def handle_text_message(message: Message, state: FSMContext, bot: Bot) -> 
 
     # Проверяем статус пользователя
     user_status = operator_handler.get_user_status(user_id)
-    logger.info(f"👤 Статус пользователя {user_id}: {user_status.value}")
+    logger.info(f"👤 Статус пользователя {user_id}: {user_status}")
 
     # Маршрутизация по статусу
     if user_status == UserStatus.WAITING_OPERATOR:
@@ -56,7 +56,7 @@ async def handle_text_message(message: Message, state: FSMContext, bot: Bot) -> 
         await _handle_with_operator(message, user_id, bot)
     elif user_status == UserStatus.RATING_OPERATOR:
         await _handle_rating_required(message)
-    elif current_state == UserState.SEARCHING_LISTS:
+    elif current_state == UserStatus.SEARCHING_LISTS:
         await _handle_lists_search(message, state)
     else:
         # Обычная обработка сообщения с использованием ИИ
@@ -113,10 +113,128 @@ async def _handle_rating_required(message: Message) -> None:
 
 
 async def _handle_lists_search(message: Message, state: FSMContext) -> None:
-    """Обработка поиска в списках"""
-    # Здесь будет логика поиска в списках
-    # Пока заглушка
-    await message.answer("🔍 Поиск в списках временно недоступен")
+    """Обработка поиска в списках участников"""
+    try:
+        query = message.text.strip()
+        
+        if not query:
+            await message.answer(
+                "❌ Пустой запрос\n\n"
+                "Пожалуйста, напишите имя фамилия для поиска.\n\n"
+                "📝 Пример: Анна Иванова"
+            )
+            return
+        
+        # Отправляем сообщение о начале поиска
+        search_message = await message.answer(f"🔍 Поиск: {query}\n\nПроверяю списки участников...")
+        
+        # Выполняем поиск
+        results = await search_name_in_lists(query, search_type='student_lists')
+        
+        # Очищаем состояние
+        await state.clear()
+        
+        # Формируем ответ
+        if not results:
+            response_text = (
+                f"❌ Результат поиска: '{query}'\n\n"
+                "🔍 В списках участников технопарка совпадений не найдено.\n\n"
+                "💡 Рекомендации:\n"
+                "• Проверьте правильность написания\n"
+                "• Попробуйте ввести только имя или фамилию\n"
+                "• Обратитесь к консультанту для уточнения"
+            )
+            
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔍 Поиск другого имени", callback_data="check_lists")],
+                [InlineKeyboardButton(text="👨‍💼 Связаться с консультантом", callback_data="request_consultant")],
+                [InlineKeyboardButton(text="🔙 Главное меню", callback_data="back_to_menu")]
+            ])
+        else:
+            response_text = f"✅ Найдено: {len(results)} совпадений\n\n"
+            response_text += f"👤 Поиск: {query}\n\n"
+            
+            # Группируем результаты по сменам
+            shifts_data = {}
+            for result in results:
+                shift_name = result['shift']
+                if shift_name not in shifts_data:
+                    shifts_data[shift_name] = []
+                shifts_data[shift_name].append(result)
+            
+            # Сортируем смены по году (новые сверху)
+            def extract_year_from_shift(shift_name):
+                import re
+                # Ищем год в названии смены
+                year_match = re.search(r'20\d{2}', shift_name)
+                if year_match:
+                    return int(year_match.group())
+                
+                # Если год не найден, определяем по месяцам
+                months_order = {
+                    'январь': 1, 'февраль': 2, 'март': 3, 'апрель': 4,
+                    'май': 5, 'июнь': 6, 'июль': 7, 'август': 8, 
+                    'сентябрь': 9, 'октябрь': 10, 'ноябрь': 11, 'декабрь': 12
+                }
+                
+                shift_lower = shift_name.lower()
+                for month, order in months_order.items():
+                    if month in shift_lower:
+                        # Предполагаем текущий год, если не указан
+                        from datetime import datetime
+                        current_year = datetime.now().year
+                        return current_year * 100 + order  # Комбинируем год и месяц для сортировки
+                
+                return 0  # Неизвестные смены в конец
+            
+            # Сортируем по году/месяцу (новые сверху)
+            sorted_shifts = sorted(shifts_data.items(), 
+                                key=lambda x: extract_year_from_shift(x[0]), 
+                                reverse=True)
+            
+            # Формируем список найденных смен
+            for i, (shift_name, shift_results) in enumerate(sorted_shifts, 1):
+                response_text += f"📋 {shift_name}\n"
+                
+                # Показываем сокращенные названия документов
+                unique_docs = set()
+                for result in shift_results:
+                    doc_name = result['document']
+                    # Применяем умное сокращение названий
+                    short_name = shorten_document_name(doc_name)
+                    unique_docs.add(short_name)
+                
+                for doc in sorted(unique_docs):
+                    response_text += f"   ✓ {doc}\n"
+                
+                response_text += "\n"
+            
+            # Добавляем пояснение
+            response_text += "💡 Данные найдены в официальных списках технопарка\n"
+            
+            # Если результатов много, обрезаем
+            if len(response_text) > 3500:
+                response_text = response_text[:3500] + "\n\n📄 *Показаны основные результаты*"
+            
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔍 Поиск другого имени", callback_data="check_lists")],
+                [InlineKeyboardButton(text="🔙 Главное меню", callback_data="back_to_menu")]
+            ])
+        
+        # Обновляем сообщение с результатами
+        await search_message.edit_text(response_text, reply_markup=keyboard)
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка поиска в списках: {e}")
+        await message.answer(
+            "⚠️ Временная ошибка поиска\n\n"
+            "Система поиска временно недоступна.\n"
+            "Попробуйте позже или обратитесь к консультанту.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="👨‍💼 Связаться с консультантом", callback_data="request_consultant")],
+                [InlineKeyboardButton(text="🔙 Главное меню", callback_data="back_to_menu")]
+            ])
+        )
     await state.clear()
 
 
@@ -284,7 +402,7 @@ async def _show_escalation_button_if_needed(message: Message, response_text: str
         logger.debug(f"Не удалось показать кнопку эскалации: {kb_error}")
 
 
-async def handle_media_message(message: Message, media_type: str, bot: Bot) -> None:
+async def handle_media_message(message: Message, bot: Bot) -> None:
     """
     Обработка медиа сообщений с учетом статуса пользователя
     
@@ -297,7 +415,7 @@ async def handle_media_message(message: Message, media_type: str, bot: Bot) -> N
 
     # Исключаем операторов
     if operator_handler.operator_manager.is_operator(user_id):
-        logger.info(f"📨 Медиа от оператора {user_id}: {media_type}")
+        logger.info(f"📨 Медиа от оператора {user_id}")
         # Пересылаем медиа пользователю
         success = await operator_handler.forward_operator_media(user_id, message, bot)
         if not success:
@@ -306,7 +424,7 @@ async def handle_media_message(message: Message, media_type: str, bot: Bot) -> N
 
     user_status = operator_handler.get_user_status(user_id)
     logger.info(
-        f"📎 Получено {media_type} от пользователя {user_id}, статус: {user_status.value}"
+        f"📎 Получено медиа от пользователя {user_id}, статус: {user_status}"
     )
 
     # Пользователь ожидает консультанта
@@ -319,7 +437,7 @@ async def handle_media_message(message: Message, media_type: str, bot: Bot) -> N
     # Пользователь подключен к консультанту
     if user_status == UserStatus.WITH_OPERATOR:
         logger.info(
-            f"💬 Пересылаем {media_type} от пользователя {user_id} консультанту"
+            f"💬 Пересылаем медиа от пользователя {user_id} консультанту"
         )
         success = await operator_handler.forward_user_message(user_id, message, bot)
         if not success:
@@ -335,7 +453,7 @@ async def handle_media_message(message: Message, media_type: str, bot: Bot) -> N
 
     # Обычный режим - медиа не поддерживается ИИ
     await message.answer(
-        f"🎤 Извините, обработка медиа ({media_type}) временно недоступна.\n"
+        "🎤 Извините, обработка медиа временно недоступна.\n"
         "📝 Пожалуйста, отправьте ваш вопрос текстом или обратитесь к оператору: /help"
     )
 
@@ -344,34 +462,15 @@ def register_message_handlers(dp, bot: Bot) -> None:
     """Регистрация обработчиков сообщений"""
     # Текстовые сообщения
     dp.message.register(
-        lambda msg, state: handle_text_message(msg, state, bot),
+        handle_text_message,
         F.text
     )
     
-    # Медиа сообщения
+
     dp.message.register(
-        lambda msg: handle_media_message(msg, "фото", bot),
-        F.photo
+        handle_media_message,
+        F.audio, F.sticker, F.video, F.voice, F.document, F.photo
     )
-    dp.message.register(
-        lambda msg: handle_media_message(msg, "документ", bot),
-        F.document
-    )
-    dp.message.register(
-        lambda msg: handle_media_message(msg, "голосовое сообщение", bot),
-        F.voice
-    )
-    dp.message.register(
-        lambda msg: handle_media_message(msg, "видео", bot),
-        F.video
-    )
-    dp.message.register(
-        lambda msg: handle_media_message(msg, "аудио", bot),
-        F.audio
-    )
-    dp.message.register(
-        lambda msg: handle_media_message(msg, "стикер", bot),
-        F.sticker
-    )
+
     
     logger.info("✅ Обработчики сообщений зарегистрированы")

@@ -4,15 +4,12 @@ from datetime import datetime
 from enum import Enum
 from aiogram import types, Bot
 from aiogram.fsm.state import State, StatesGroup
+from aiogram.filters import and_f, or_f
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from src.core.constants import UserStatus
 
 logger = logging.getLogger(__name__)
 
-class UserStatus(Enum):
-    NORMAL = "normal"
-    WAITING_OPERATOR = "waiting_operator" 
-    WITH_OPERATOR = "with_operator"
-    RATING_OPERATOR = "rating_operator"
 
 class OperatorState(StatesGroup):
     WAITING_OPERATOR = State()
@@ -88,7 +85,7 @@ class OperatorHandler:
     def set_user_status(self, user_id: int, status: UserStatus):
         """Установить статус пользователя"""
         self.user_states[user_id] = status
-        logger.info(f"Пользователь {user_id} изменил статус на {status.value}")
+        logger.info(f"Пользователь {user_id} изменил статус на {status}")
     
     async def analyze_message_for_escalation(self, message: str, ai_confidence: float = 0.8) -> Dict:
         """Анализировать сообщение на необходимость эскалации"""
@@ -693,9 +690,18 @@ def register_operator_handlers(dp, bot):
             await callback.message.edit_text("❌ Ошибка при обработке оценки")
     
     # Обработчик сообщений от пользователей в сессии
-    @dp.message(F.text)
+    @dp.message(
+    and_f(
+        F.text,  # есть текст
+        or_f(
+            F.status == UserStatus.WITH_OPERATOR,
+            F.status == UserStatus.WAITING_OPERATOR
+        )
+    )
+)
     async def handle_user_messages(message: types.Message):
         """Обработка сообщений пользователей"""
+        logger.info("Проверка handle_user_messages")
         user_id = message.from_user.id
         status = operator_handler.get_user_status(user_id)
         
@@ -717,14 +723,11 @@ def register_operator_handlers(dp, bot):
                 )
     
     # Обработчик сообщений от операторов
-    @dp.message(F.text)
+    @dp.message(F.text, lambda msg: operator_handler.operator_manager.is_operator(msg.from_user.id))
     async def handle_operator_messages(message: types.Message):
         """Обработка сообщений от операторов"""
+        logger.info("Проверка handle_operator_messages")
         operator_id = message.from_user.id
-        
-        # Проверяем, является ли отправитель оператором
-        if not operator_handler.operator_manager.is_operator(operator_id):
-            return
         
         # Пересылаем сообщение пользователю
         success, result_message = await operator_handler.forward_operator_message(

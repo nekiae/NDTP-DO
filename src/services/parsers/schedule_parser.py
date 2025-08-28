@@ -279,7 +279,7 @@ class ScheduleParser:
             
             # Проверяем изменения в расписании для уведомлений
             try:
-                from notification_system import notification_system
+                from src.handlers.notification_system import notification_system
                 changes = notification_system.check_schedule_changes(new_shifts_data)
                 
                 # Сохраняем данные

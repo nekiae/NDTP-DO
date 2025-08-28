@@ -340,6 +340,7 @@ def register_brainstorm_handlers(router: Router, bot):
         """Обработка ответа пользователя"""
         user_id = message.from_user.id
         data = await state.get_data()
+        logger.info(f"🧠 Пользователь {user_id} ответил (раунд {data['rounds']}): {message.text[:50]}...")
         
         # Добавляем ответ пользователя в историю
         user_message = {"role": "user", "content": message.text}
@@ -348,7 +349,7 @@ def register_brainstorm_handlers(router: Router, bot):
         
         await state.update_data(history=data["history"], rounds=data["rounds"])
         
-        logger.info(f"🧠 Пользователь {user_id} ответил (раунд {data['rounds']}): {message.text[:50]}...")
+        
         
         # Генерируем следующий вопрос
         await ask_next_question(message, state)

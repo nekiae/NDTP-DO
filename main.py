@@ -96,16 +96,16 @@ class NDTPBot:
         """Настройка middleware"""
         logger.info("🛡️ Настройка middleware...")
         
-        # Middleware для логирования
+        #Middleware для логирования
         self.dp.message.middleware(LoggingMiddleware())
         self.dp.callback_query.middleware(LoggingMiddleware())
         
-        # Middleware для лимитов API
-        limit_middleware = HourlyLimitMiddleware()
-        self.dp.message.middleware(limit_middleware)
-        self.dp.callback_query.middleware(limit_middleware)
+        #Middleware для лимитов API
+        #limit_middleware = HourlyLimitMiddleware()
+        #self.dp.message.middleware(limit_middleware)
+        #self.dp.callback_query.middleware(limit_middleware)
         
-        # Middleware для проверки прав администратора
+        #Middleware для проверки прав администратора
         self.dp.message.middleware(AdminCheckMiddleware())
         
         logger.info(f"✅ Middleware настроен (лимит: {config.hourly_request_limit} запросов/час)")
@@ -114,33 +114,32 @@ class NDTPBot:
         """Регистрация всех обработчиков"""
         logger.info("📝 Регистрация обработчиков...")
         
-        # Регистрируем обработчики операторов ПЕРЕД основными
-        await self._register_operator_handlers()
-        
-        # Регистрируем модули ПЕРЕД основными обработчиками
-        await self._register_module_handlers()
-        
         # Основные команды
         register_basic_commands(self.dp, self.bot)
+
+        # Регистрируем обработчики операторов ПЕРЕД основными
+        self.register_operator_handlers()
+        
+        # Регистрируем модули ПЕРЕД основными обработчиками
+        self.register_module_handlers()
         
         # Обработчики сообщений (должны быть последними)
         register_message_handlers(self.dp, self.bot)
         
         # DEV команды (если включены)
-        register_dev_commands(self.dp, self.bot)
+        #register_dev_commands(self.dp, self.bot)
         
         logger.info("✅ Все обработчики зарегистрированы")
     
-    async def _register_operator_handlers(self) -> None:
+    def register_operator_handlers(self) -> None:
         """Регистрация обработчиков операторов"""
-        try:
-            from src.handlers.operator_handler import register_operator_handlers
-            register_operator_handlers(self.dp, self.bot)
-            logger.info("✅ Обработчики операторов зарегистрированы")
-        except Exception as e:
-            logger.error(f"⚠️ Ошибка регистрации обработчиков операторов: {e}")
+        
+        from src.handlers.operator_handler import register_operator_handlers
+        register_operator_handlers(self.dp, self.bot)
+        logger.info("✅ Обработчики операторов зарегистрированы")
+
     
-    async def _register_module_handlers(self) -> None:
+    def register_module_handlers(self) -> None:
         """Регистрация обработчиков модулей"""
         # Квиз модуль
         if config.enable_quiz:
@@ -149,7 +148,7 @@ class NDTPBot:
                 register_quiz_handlers(self.dp, self.bot)
                 logger.info("✅ Обработчики квиза зарегистрированы")
             except Exception as e:
-                logger.error(f"⚠️ Ошибка регистрации квиза: {e}")
+                logger.error(f"⚠️ Ошибка регистрации модулей: {e}")
         
         # Брейншторм модуль
         if config.enable_brainstorm:
@@ -163,6 +162,13 @@ class NDTPBot:
                 logger.info("✅ Обработчики брейншторма зарегистрированы")
             except Exception as e:
                 logger.error(f"⚠️ Ошибка регистрации брейншторма: {e}")
+        if config.enable_brainstorm:
+            try:
+                from src.modules.calendar_module import register_calendar_hadler
+                register_calendar_hadler(self.dp)
+                logger.info("✅ Обработчики календаря зарегистрированы")
+            except Exception as e:
+                logger.error(f"⚠️ Ошибка регистрации календаря: {e}")
     
     async def _initialize_modules(self) -> None:
         """Инициализация дополнительных модулей"""

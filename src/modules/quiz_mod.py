@@ -433,6 +433,11 @@ def register_quiz_handlers(dp, bot: Bot):
     @dp.message(F.text == "/quiz")
     async def quiz_command(message: Message, state: FSMContext):
         await quiz_start(message, state, bot)
+
+    @dp.callback_query(F.data == "start_quiz")
+    async def quiz_callback(callback: CallbackQuery, state: FSMContext, bot: Bot):
+        await callback.answer()
+        await quiz_start(callback.message, state, bot)
     
     # Обработчики состояний квиза
     @dp.message(QuizState.Q1)
