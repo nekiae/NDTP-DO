@@ -4,7 +4,7 @@
 import re
 from datetime import datetime
 from typing import Dict, List
-
+from aiogram.fsm.state import StatesGroup, State
 
 # === СИСТЕМНЫЕ КОНСТАНТЫ ===
 PROJECT_NAME = "NDTP Bot"
@@ -108,12 +108,13 @@ def get_system_prompt() -> str:
 
 
 # === СТАТУСЫ ПОЛЬЗОВАТЕЛЕЙ ===
-class UserStatus:
-    NORMAL = "normal"
-    WAITING_OPERATOR = "waiting_operator"
-    WITH_OPERATOR = "with_operator"
-    RATING_OPERATOR = "rating_operator"
-    SEARCHING_LISTS = "searching_list"
+class UserStatus(StatesGroup):
+    NORMAL = State()
+    WAITING_OPERATOR = State()
+    WITH_OPERATOR = State()
+    RATING_OPERATOR = State()
+    SEARCHING_LISTS = State()
+    LOAD_MEDIA = State()
 
 
 # === РЕЖИМЫ RAG ===

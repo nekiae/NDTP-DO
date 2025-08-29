@@ -10,7 +10,7 @@ import PyPDF2
 import requests
 from bs4 import BeautifulSoup
 
-from ...core.config import config
+from src.core.config import config
 
 try:
     from pdf2image import convert_from_bytes

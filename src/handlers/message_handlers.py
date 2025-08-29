@@ -408,7 +408,6 @@ async def handle_media_message(message: Message, bot: Bot) -> None:
     
     Args:
         message: Сообщение с медиа
-        media_type: Тип медиа (фото, документ, голосовое и т.д.)
         bot: Экземпляр бота
     """
     user_id = message.from_user.id

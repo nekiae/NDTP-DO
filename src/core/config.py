@@ -60,7 +60,10 @@ class Config(BaseSettings):
         le=100,
         description="Лимит одновременных запросов к LLM"
     )
+
+    max_file_size: int = Field(default = 1024 * 1024 * 1024)  # 1GB
     
+    allowed_file_types: list[str] = ["image/jpeg", "image/png", "image/heic", "video/mp4", "video/mov", "image/jpg"]
     # === НАСТРОЙКИ REDIS ===
     redis_url: str = Field(
         default="redis://localhost",
@@ -68,6 +71,15 @@ class Config(BaseSettings):
         description="URL для подключения к Redis"
     )
     
+    # Database
+    postgres_db: str
+    postgres_user: str
+    postgres_password : str
+    postgres_host : str
+    @property
+    def database_url(self) -> str:
+        return f"postgresql://{self.postgres_user}:{self.postgres_password}@{self.postgres_host}:5432/{self.postgres_db}"
+
     # === НАСТРОЙКИ ЛОГИРОВАНИЯ ===
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = Field(
         default="INFO",
@@ -123,7 +135,11 @@ class Config(BaseSettings):
         env="RAG_MODE",
         description="Режим работы RAG системы"
     )
-    
+    # AWS S3
+    aws_access_key_id: str = Field()
+    aws_secret_access_key: str = Field()
+    aws_s3_bucket_name: str = Field()
+    aws_host: str = Field()
     # === ДИРЕКТОРИИ (вычисляемые поля) ===
     @property
     def data_dir(self) -> Path:

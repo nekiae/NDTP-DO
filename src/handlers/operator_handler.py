@@ -1,7 +1,7 @@
 import logging
 from typing import Optional, Dict, List, Tuple
 from datetime import datetime
-from enum import Enum
+
 from aiogram import types, Bot
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.filters import and_f, or_f
@@ -98,7 +98,7 @@ class OperatorHandler:
         }
     
     async def escalate_to_operator(self, user_id: int, message: types.Message, 
-                                 auto_escalation: bool = False, bot=None) -> bool:
+                                auto_escalation: bool = False, bot=None) -> bool:
         """Эскалировать запрос к оператору"""
         
         if self.get_user_status(user_id) != UserStatus.NORMAL:

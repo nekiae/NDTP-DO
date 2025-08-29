@@ -22,6 +22,7 @@ from src.core.middleware import (
     AdminCheckMiddleware
 )
 from src.handlers.basic_commands import register_basic_commands
+from src.modules.load_media import register_load_message_handler
 from src.handlers.message_handlers import register_message_handlers
 from src.handlers.dev_commands import register_dev_commands
 from src.services.context_service import initialize_rag_systems
@@ -115,8 +116,9 @@ class NDTPBot:
         logger.info("📝 Регистрация обработчиков...")
         
         # Основные команды
-        register_basic_commands(self.dp, self.bot)
+        register_load_message_handler(self.dp)
 
+        register_basic_commands(self.dp)
         # Регистрируем обработчики операторов ПЕРЕД основными
         self.register_operator_handlers()
         

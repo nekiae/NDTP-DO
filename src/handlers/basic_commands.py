@@ -4,7 +4,7 @@
 import logging
 
 from aiogram import Bot, F
-from aiogram.filters import Command
+from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.types import (
     CallbackQuery,
@@ -16,10 +16,13 @@ from aiogram.types import (
 from ..core.config import config
 from ..handlers.operator_handler import operator_handler, OperatorState
 from src.core.constants import UserStatus
+from src.database.models import User
+from src.database import get_db_session
+from src.services import auth_service
 logger = logging.getLogger(__name__)
 
 
-async def cmd_start(message: Message) -> None:
+async def cmd_start(message: Message, command: CommandObject) -> None:
     """Стартовое приветствие по ролям: админ / оператор / пользователь"""
     user_id = message.from_user.id
     username = message.from_user.username or "без username"
@@ -56,8 +59,25 @@ async def cmd_start(message: Message) -> None:
         )
         await message.answer(text)
         return
+    args = command.args
+    logger.info(args)
+    if args:
+        logger.info(args)
+        auth_service_inst = auth_service.AuthService(next(get_db_session()))
+        if auth_service_inst.is_user_authenticated(message.from_user.id):
+            logger.info(f"User {message.from_user.id} is auth")
+            await message.bot.send_message(chat_id=message.chat.id, text="Вы уже авторизованны")
+            return
 
-    # Пользователь: обычное приветствие с меню
+        user: User = auth_service_inst.authenticate_with_code(
+            code=args, telegram_user_id=message.from_user.id
+        )
+        if not user:
+            await message.bot.send_message(chat_id=message.chat.id, text="Код неверный или истек")
+            return
+
+        await message.bot.send_message(chat_id=message.chat.id, text=f"Добро пожаловать {user.username}")
+        return
     await show_main_menu(message)
 
 
@@ -123,7 +143,14 @@ async def show_main_menu(message: Message) -> None:
             )
         ]
     )
-
+    auth_service_inst = auth_service.AuthService(next(get_db_session()))
+    if auth_service_inst.is_user_authenticated(message.from_user.id):
+        keyboard_rows.append(
+            [InlineKeyboardButton(
+                text="📷 Загрузить медиа",
+                callback_data="load_media",
+            )]
+    )
     keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
     await message.answer(welcome_text, reply_markup=keyboard)
 
@@ -265,6 +292,7 @@ async def cmd_cancel(message: Message, state: FSMContext, bot: Bot) -> None:
         await state.clear()
         await message.answer("❌ Операция отменена. Чем еще могу помочь?")
     else:
+        await state.clear()
         await message.answer("❌ Нечего отменять.")
 
 
@@ -272,7 +300,6 @@ async def handle_request_consultant(callback: CallbackQuery, state: FSMContext, 
     """Обработка кнопки 'Связаться с консультантом'"""
     try:
         user = callback.from_user
-        chat_id = callback.message.chat.id if callback.message else user.id
         
         # Эскалируем с явными атрибутами пользователя
         success = await operator_handler.escalate_to_operator(
@@ -473,7 +500,18 @@ async def handle_back_to_menu(callback: CallbackQuery):
     await callback.message.edit_text(welcome_text, reply_markup=keyboard)
     await callback.answer()
 
-
+async def handle_load_media(callback: CallbackQuery, state: FSMContext):
+    bot = callback.bot
+    text = '''Теперь сюда можно отправлять:
+        📷 фото (одно или альбом),
+        🎥 видео,
+        📂 документы (jpg, png, mov и др.).
+        ❌ Стикеры, аудио и голосовые сообщения не поддерживаются.
+        💡 Дополнение: присланные материалы могут быть использованы администрацией Национального детского технопарка для публикаций в соцсетях и других материалах.
+        После этого сообщения просто скидывайте свои фото, видео и документы.
+        Если передумали, чтобы отменить загрузку, напишите: /cancel ✅'''
+    await bot.send_message(callback.message.chat.id, text)
+    await state.set_state(UserStatus.LOAD_MEDIA)
 
 async def handle_check_lists(callback: CallbackQuery, state: FSMContext):
     """Начало проверки списков"""
@@ -509,7 +547,7 @@ async def handle_check_lists(callback: CallbackQuery, state: FSMContext):
         logger.error(f"❌ Ошибка при запуске поиска списков: {e}")
         await callback.answer("❌ Ошибка запуска поиска", show_alert=True)
 
-def register_basic_commands(dp, bot: Bot) -> None:
+def register_basic_commands(dp) -> None:
     """Регистрация базовых команд"""
     dp.message.register(cmd_start, Command("start"))
     dp.message.register(cmd_menu, Command("menu"))
@@ -522,7 +560,7 @@ def register_basic_commands(dp, bot: Bot) -> None:
     dp.callback_query.register(handle_info_admission,F.data == "info_admission")
     dp.callback_query.register(handle_check_lists,F.data == "check_lists")
     dp.callback_query.register(handle_back_to_menu,F.data == "back_to_menu")
-    
+    dp.callback_query.register(handle_load_media,F.data == "load_media")
     dp.callback_query.register(
         handle_request_consultant, 
         F.data == "request_consultant"

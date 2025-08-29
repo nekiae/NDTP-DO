@@ -6,7 +6,7 @@ import aiohttp
 from bs4 import BeautifulSoup
 import re
 
-from ..core.config import config
+from src.core.config import config
 
 from aiogram import F
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
