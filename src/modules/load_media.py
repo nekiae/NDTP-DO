@@ -56,4 +56,4 @@ class Handler:
 def register_load_message_handler(dp):
     handler = Handler(AuthService(next(get_db_session())), S3Service())
 
-    dp.message.register(handler.handle_photo, F.photo | F.document | F.video, UserStatus.LOAD_MEDIA)
+    dp.message.register(handler.handle_photo, F.photo | F.document | F.video, )
