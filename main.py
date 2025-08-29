@@ -196,30 +196,10 @@ class NDTPBot:
         """Настройка команд бота в меню Telegram"""
         try:
             commands = [
-                types.BotCommand(command="start", description="Запустить бота"),
-                types.BotCommand(command="menu", description="Главное меню"),
+                types.BotCommand(command="start", description="Запустить бота/Меню"),
                 types.BotCommand(command="help", description="Связаться с консультантом"),
-                types.BotCommand(command="status", description="Показать статус"),
                 types.BotCommand(command="cancel", description="Отменить операцию"),
             ]
-            
-            # Добавляем команды модулей если они доступны
-            if config.enable_calendar:
-                commands.append(
-                    types.BotCommand(command="calendar", description="Календарь смен")
-                )
-            if config.enable_quiz:
-                commands.append(
-                    types.BotCommand(command="quiz", description="Квиз: подбор направления")
-                )
-            if config.enable_brainstorm:
-                commands.append(
-                    types.BotCommand(command="brainstorm", description="Брейншторм идей")
-                )
-            if config.enable_lists:
-                commands.append(
-                    types.BotCommand(command="checklists", description="Проверить списки")
-                )
             
             await self.bot.set_my_commands(commands)
             logger.info("✅ Команды бота зарегистрированы в меню Telegram")
